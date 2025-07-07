@@ -99,6 +99,7 @@ class TrainDP3Workspace:
         # configure dataset
         dataset: BaseDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
+        print(f"Dataset: {dataset}")
 
         assert isinstance(dataset, BaseDataset), print(f"dataset must be BaseDataset, got {type(dataset)}")
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
@@ -503,4 +504,5 @@ def main(cfg):
     workspace.run()
 
 if __name__ == "__main__":
+    print(f"Running from {pathlib.Path(__file__).parent}")
     main()

@@ -1,0 +1,53 @@
+name: franka_custom
+
+task_name: franka_custom
+
+image_shape: &image_shape [3, 84, 84]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim, point_cloud
+  obs:
+    point_cloud:
+      shape: [512, 3]  # num_points, xyz (or xyz+rgb if using colors)
+      type: point_cloud
+    agent_pos:
+      shape: [7]  # Adjust based on your robot state dimension
+      type: low_dim
+  action:
+    shape: [7]  # Adjust based on your action dimension
+
+env_runner:
+  _target_: diffusion_policy_3d.env_runner.base_runner.BaseRunner
+  # Note: You'll need to create a custom env_runner for Franka if needed
+  eval_episodes: 20
+  max_steps: 300
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  task_name: franka_custom
+  render_size: 84
+  use_point_crop: ${policy.use_point_crop}
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.franka_dataset.FrankaDataset
+  dataset_path: /path/to/your/franka/dataset  # Update this path
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null  # Use all episodes or specify a number
+  task_name: franka_custom
+  use_point_cloud: true
+  num_points: 512
+  point_cloud_sampling_method: 'fps'  # 'fps' or 'uniform'
+  camera_intrinsics:
+    fx: 525.0
+    fy: 525.0
+    cx: 319.5
+    cy: 239.5
+    width: 640
+    height: 480
+  workspace_bounds:  # Optional: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+    - [0.3, 0.8]   # x bounds
+    - [-0.3, 0.3]  # y bounds
+    - [0.0, 0.5]   # z bounds
