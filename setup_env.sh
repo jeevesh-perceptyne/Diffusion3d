@@ -41,6 +41,7 @@ pip install \
   imageio \
   av \
   matplotlib \
-  termcolor
+  termcolor \
+  boto3
 
 echo "[✓] Setup complete."
