@@ -42,7 +42,8 @@ class TrainDP3Workspace:
         self.cfg = cfg
         self._output_dir = output_dir
         self._saving_thread = None
-        
+        #print config with proper indentation like json
+        cprint(OmegaConf.to_yaml(cfg), 'cyan')
         # set seed
         seed = cfg.training.seed
         torch.manual_seed(seed)
@@ -67,6 +68,7 @@ class TrainDP3Workspace:
         # configure training state
         self.global_step = 0
         self.epoch = 0
+        print(f"Initial global step: {self.global_step}, epoch: {self.epoch}")
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -79,11 +81,11 @@ class TrainDP3Workspace:
             cfg.training.checkpoint_every = 1
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
-            RUN_ROLLOUT = True
+            RUN_ROLLOUT = False
             RUN_CKPT = False
             verbose = True
         else:
-            RUN_ROLLOUT = True
+            RUN_ROLLOUT = False
             RUN_CKPT = True
             verbose = False
         
@@ -112,7 +114,7 @@ class TrainDP3Workspace:
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
-
+    
         # configure lr scheduler
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
@@ -132,15 +134,15 @@ class TrainDP3Workspace:
             ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
-
+        env_runner = None
         # configure env
-        env_runner: BaseRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
+        # env_runner: BaseRunner
+        # env_runner = hydra.utils.instantiate(
+        #     cfg.task.env_runner,
+        #     output_dir=self.output_dir)
 
-        if env_runner is not None:
-            assert isinstance(env_runner, BaseRunner)
+        # if env_runner is not None:
+        #     assert isinstance(env_runner, BaseRunner)
         
         cfg.logging.name = str(cfg.logging.name)
         cprint("-----------------------------", "yellow")
@@ -192,7 +194,7 @@ class TrainDP3Workspace:
                         train_sampling_batch = batch
                 
                     # compute loss
-                    t1_1 = time.time()
+                    t1_1 = time.time()  
                     raw_loss, loss_dict = self.model.compute_loss(batch)
                     loss = raw_loss / cfg.training.gradient_accumulate_every
                     loss.backward()
@@ -500,6 +502,31 @@ class TrainDP3Workspace:
         'diffusion_policy_3d', 'config'))
 )
 def main(cfg):
+    import sys
+    
+    # Parse command line arguments for number of episodes
+    max_episodes = None
+    pcd_type = 'merged_1024'  # default
+    
+    # Simple argument parsing
+    for i, arg in enumerate(sys.argv):
+        if arg == '--max_episodes' and i + 1 < len(sys.argv):
+            try:
+                max_episodes = int(sys.argv[i + 1])
+                print(f"Using max_episodes: {max_episodes}")
+            except ValueError:
+                print(f"Invalid max_episodes value: {sys.argv[i + 1]}")
+        elif arg == '--pcd_type' and i + 1 < len(sys.argv):
+            pcd_type = sys.argv[i + 1]
+            print(f"Using pcd_type: {pcd_type}")
+    
+    # Override dataset configuration
+    if max_episodes is not None:
+        cfg.task.dataset.max_train_episodes = max_episodes
+    
+    # Set PCD type
+    cfg.task.dataset.pcd_type = pcd_type
+    
     workspace = TrainDP3Workspace(cfg)
     workspace.run()
 

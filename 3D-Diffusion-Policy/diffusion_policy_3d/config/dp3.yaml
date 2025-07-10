@@ -1,5 +1,5 @@
 defaults:
-  - task: adroit_hammer
+  - task: franka_custom
 
 name: train_dp3
 
