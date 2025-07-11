@@ -10,7 +10,6 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
-import dill
 from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
@@ -20,20 +19,16 @@ import wandb
 import tqdm
 import numpy as np
 from termcolor import cprint
-import shutil
 import time
-import threading
 from hydra.core.hydra_config import HydraConfig
 from diffusion_policy_3d.policy.dp3 import DP3
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 from diffusion_policy_3d.env_runner.base_runner import BaseRunner
-from diffusion_policy_3d.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy_3d.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy_3d.model.diffusion.ema_model import EMAModel
 from diffusion_policy_3d.model.common.lr_scheduler import get_scheduler
 import boto3
 from botocore.exceptions import NoCredentialsError
-import uuid
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -46,8 +41,6 @@ class TrainDP3Workspace:
         self._output_dir = output_dir
         self.s3_bucket = 'pr-checkpoints'
         self.s3_client = boto3.client('s3')
-        self.exp_name = getattr(cfg, 'exp_name', 'default_exp')
-        self.run_id = str(uuid.uuid4())
         cprint(OmegaConf.to_yaml(cfg), 'cyan')
         seed = cfg.training.seed
         torch.manual_seed(seed)
@@ -68,9 +61,9 @@ class TrainDP3Workspace:
 
     def s3_ckpt_path(self, epoch=None, latest=False):
         if latest:
-            return f"{self.exp_name}/{self.run_id}/latest/checkpoint.pth"
+            return f"DP3_outputs/latest/checkpoint.pth"
         else:
-            return f"{self.exp_name}/{self.run_id}/epoch_{epoch}/checkpoint.pth"
+            return f"DP3_outputs/epoch_{epoch}/checkpoint.pth"
 
     def save_checkpoint_s3(self, epoch, latest=False):
         checkpoint = {
@@ -86,25 +79,29 @@ class TrainDP3Workspace:
             checkpoint['normalizer_state_dict'] = self.model.normalizer.state_dict()
         if self.ema_model is not None:
             checkpoint['ema_state_dict'] = self.ema_model.state_dict()
+        
         local_path = f'checkpoint_tmp.pth'
         torch.save(checkpoint, local_path)
-        s3_path = self.s3_ckpt_path(epoch=epoch)
-        self.s3_client.upload_file(local_path, self.s3_bucket, s3_path)
+        
         if latest:
-            s3_latest = self.s3_ckpt_path(latest=True)
-            self.s3_client.upload_file(local_path, self.s3_bucket, s3_latest)
+            # Save only to latest path when latest=True
+            s3_path = self.s3_ckpt_path(latest=True)
+        else:
+            # Save only to epoch-specific path when latest=False
+            s3_path = self.s3_ckpt_path(epoch=epoch)
+        
+        self.s3_client.upload_file(local_path, self.s3_bucket, s3_path)
+        
         # Also save config as yaml for easy inspection/inference
         config_yaml_path = 'config_tmp.yaml'
         with open(config_yaml_path, 'w') as f:
             OmegaConf.save(self.cfg, f)
         s3_config_path = s3_path.replace('checkpoint.pth', 'config.yaml')
         self.s3_client.upload_file(config_yaml_path, self.s3_bucket, s3_config_path)
-        if latest:
-            s3_config_latest = s3_latest.replace('checkpoint.pth', 'config.yaml')
-            self.s3_client.upload_file(config_yaml_path, self.s3_bucket, s3_config_latest)
+        
         os.remove(local_path)
         os.remove(config_yaml_path)
-        print(f"Checkpoint and config saved to S3: {s3_path}{' and latest/' if latest else ''}")
+        print(f"Checkpoint and config saved to S3: {s3_path}")
 
     def load_latest_checkpoint_s3(self, device):
         s3_latest = self.s3_ckpt_path(latest=True)
@@ -152,12 +149,10 @@ class TrainDP3Workspace:
         
         RUN_VALIDATION = False # reduce time cost
         
-        # resume training
+        # Resume from latest S3 checkpoint if requested
+        device = torch.device(cfg.training.device)
         if cfg.training.resume:
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+            self.load_latest_checkpoint_s3(device)
 
         # configure dataset
         dataset: BaseDataset
@@ -188,10 +183,7 @@ class TrainDP3Workspace:
             # however huggingface diffusers steps it every batch
             last_epoch=self.global_step-1
         )
-        # Resume from latest checkpoint if requested
-        device = torch.device(cfg.training.device)
-        if cfg.training.resume:
-            self.load_latest_checkpoint_s3(device)
+        
         # configure ema
         ema: EMAModel = None
         if cfg.training.use_ema:
@@ -223,12 +215,6 @@ class TrainDP3Workspace:
             {
                 "output_dir": self.output_dir,
             }
-        )
-
-        # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
         )
 
         # device transfer
@@ -369,27 +355,6 @@ class TrainDP3Workspace:
             if env_runner is None:
                 step_log['test_mean_score'] = - train_loss
                 
-            # checkpoint
-            if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
-                # checkpointing
-                if cfg.checkpoint.save_last_ckpt:
-                    self.save_checkpoint()
-                if cfg.checkpoint.save_last_snapshot:
-                    self.save_snapshot()
-
-                # sanitize metric names
-                metric_dict = dict()
-                for key, value in step_log.items():
-                    new_key = key.replace('/', '_')
-                    metric_dict[new_key] = value
-                
-                # We can't copy the last checkpoint here
-                # since save_checkpoint uses threads.
-                # therefore at this point the file might have been empty!
-                topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-
-                if topk_ckpt_path is not None:
-                    self.save_checkpoint(path=topk_ckpt_path)
             # ========= eval end for this epoch ==========
             policy.train()
 
@@ -397,23 +362,26 @@ class TrainDP3Workspace:
             # log of last step is combined with validation and rollout
             wandb_run.log(step_log, step=self.global_step)
             self.global_step += 1
-            # Save latest checkpoint after every epoch
+            
+            # S3 Checkpoint saving strategy:
+            # 1. Save latest checkpoint after every epoch (overwrites previous latest)
             self.save_checkpoint_s3(epoch=self.epoch, latest=True)
-            # Save checkpoint every 500 epochs
+            
+            # 2. Save numbered checkpoint every 500 epochs
             if (self.epoch + 1) % 500 == 0:
                 self.save_checkpoint_s3(epoch=self.epoch + 1, latest=False)
             self.epoch += 1
             del step_log
 
     def eval(self):
-        # load the latest checkpoint
-        
+        """
+        Evaluation function - loads latest S3 checkpoint and runs evaluation
+        """
         cfg = copy.deepcopy(self.cfg)
+        device = torch.device(cfg.training.device)
         
-        lastest_ckpt_path = self.get_checkpoint_path(tag="latest")
-        if lastest_ckpt_path.is_file():
-            cprint(f"Resuming from checkpoint {lastest_ckpt_path}", 'magenta')
-            self.load_checkpoint(path=lastest_ckpt_path)
+        # Load latest checkpoint from S3
+        self.load_latest_checkpoint_s3(device)
         
         # configure env
         env_runner: BaseRunner
@@ -429,7 +397,6 @@ class TrainDP3Workspace:
 
         runner_log = env_runner.run(policy)
         
-      
         cprint(f"---------------- Eval Results --------------", 'magenta')
         for key, value in runner_log.items():
             if isinstance(value, float):
@@ -441,132 +408,7 @@ class TrainDP3Workspace:
         if output_dir is None:
             output_dir = HydraConfig.get().runtime.output_dir
         return output_dir
-    
 
-    # Remove all legacy checkpoint/save logic below
-    # (save_checkpoint, get_checkpoint_path, load_payload, load_checkpoint, create_from_checkpoint, save_snapshot, create_from_snapshot)
-    # Only S3 checkpointing is now used.
-    def save_checkpoint(self, path=None, tag='latest', 
-            exclude_keys=None,
-            include_keys=None,
-            use_thread=False):
-        if path is None:
-            path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
-        else:
-            path = pathlib.Path(path)
-        if exclude_keys is None:
-            exclude_keys = tuple(self.exclude_keys)
-        if include_keys is None:
-            include_keys = tuple(self.include_keys) + ('_output_dir',)
-
-        path.parent.mkdir(parents=False, exist_ok=True)
-        payload = {
-            'cfg': self.cfg,
-            'state_dicts': dict(),
-            'pickles': dict()
-        } 
-
-        for key, value in self.__dict__.items():
-            if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
-                # modules, optimizers and samplers etc
-                if key not in exclude_keys:
-                    if use_thread:
-                        payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
-                    else:
-                        payload['state_dicts'][key] = value.state_dict()
-            elif key in include_keys:
-                payload['pickles'][key] = dill.dumps(value)
-        if use_thread:
-            self._saving_thread = threading.Thread(
-                target=lambda : torch.save(payload, path.open('wb'), pickle_module=dill))
-            self._saving_thread.start()
-        else:
-            torch.save(payload, path.open('wb'), pickle_module=dill)
-        
-        del payload
-        torch.cuda.empty_cache()
-        return str(path.absolute())
-    
-    def get_checkpoint_path(self, tag='latest'):
-        if tag=='latest':
-            return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
-        elif tag=='best': 
-            # the checkpoints are saved as format: epoch={}-test_mean_score={}.ckpt
-            # find the best checkpoint
-            checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
-            all_checkpoints = os.listdir(checkpoint_dir)
-            best_ckpt = None
-            best_score = -1e10
-            for ckpt in all_checkpoints:
-                if 'latest' in ckpt:
-                    continue
-                score = float(ckpt.split('test_mean_score=')[1].split('.ckpt')[0])
-                if score > best_score:
-                    best_ckpt = ckpt
-                    best_score = score
-            return pathlib.Path(self.output_dir).joinpath('checkpoints', best_ckpt)
-        else:
-            raise NotImplementedError(f"tag {tag} not implemented")
-            
-            
-
-    def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
-        if exclude_keys is None:
-            exclude_keys = tuple()
-        if include_keys is None:
-            include_keys = payload['pickles'].keys()
-
-        for key, value in payload['state_dicts'].items():
-            if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
-        for key in include_keys:
-            if key in payload['pickles']:
-                self.__dict__[key] = dill.loads(payload['pickles'][key])
-    
-    def load_checkpoint(self, path=None, tag='latest',
-            exclude_keys=None, 
-            include_keys=None, 
-            **kwargs):
-        if path is None:
-            path = self.get_checkpoint_path(tag=tag)
-        else:
-            path = pathlib.Path(path)
-        payload = torch.load(path.open('rb'), pickle_module=dill, map_location='cpu')
-        self.load_payload(payload, 
-            exclude_keys=exclude_keys, 
-            include_keys=include_keys)
-        return payload
-    
-    @classmethod
-    def create_from_checkpoint(cls, path, 
-            exclude_keys=None, 
-            include_keys=None,
-            **kwargs):
-        payload = torch.load(open(path, 'rb'), pickle_module=dill)
-        instance = cls(payload['cfg'])
-        instance.load_payload(
-            payload=payload, 
-            exclude_keys=exclude_keys,
-            include_keys=include_keys,
-            **kwargs)
-        return instance
-
-    def save_snapshot(self, tag='latest'):
-        """
-        Quick loading and saving for reserach, saves full state of the workspace.
-
-        However, loading a snapshot assumes the code stays exactly the same.
-        Use save_checkpoint for long-term storage.
-        """
-        path = pathlib.Path(self.output_dir).joinpath('snapshots', f'{tag}.pkl')
-        path.parent.mkdir(parents=False, exist_ok=True)
-        torch.save(self, path.open('wb'), pickle_module=dill)
-        return str(path.absolute())
-    
-    @classmethod
-    def create_from_snapshot(cls, path):
-        return torch.load(open(path, 'rb'), pickle_module=dill)
-    
 
 @hydra.main(
     version_base=None,

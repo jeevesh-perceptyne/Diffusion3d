@@ -7,7 +7,7 @@ import cv2
 from typing import Tuple
 from PIL import Image
 from termcolor import cprint
-import open3d as o3d
+# import open3d as o3d
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.replay_buffer import ReplayBuffer
 from diffusion_policy_3d.common.sampler import (

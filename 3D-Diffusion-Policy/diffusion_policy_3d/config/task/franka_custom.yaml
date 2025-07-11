@@ -29,12 +29,12 @@ env_runner:
 
 dataset:
   _target_: diffusion_policy_3d.dataset.franka_dataset.FrankaDataset
-  dataset_path: /mnt/SharedDrive/franka_recordings
+  dataset_path: /mnt/data/franka_recordings
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
-  val_ratio: 0.02
+  val_ratio: 0.2
   max_train_episodes: null
   task_name: franka_custom
   use_point_cloud: true

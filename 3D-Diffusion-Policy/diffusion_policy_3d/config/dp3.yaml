@@ -101,14 +101,14 @@ training:
   device: "cuda:0"
   seed: 42
   debug: False
-  resume: True
+  resume: False 
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3000
-  gradient_accumulate_every: 1
+  num_epochs: 10000
+  gradient_accumulate_every: 300
   use_ema: True
   rollout_every: 2
-  checkpoint_every: 2
+  checkpoint_every: 500
   val_every: 1
   sample_every: 5
   max_train_steps: null
