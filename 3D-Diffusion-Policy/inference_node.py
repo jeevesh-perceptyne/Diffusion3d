@@ -159,7 +159,7 @@ class FrankaDiffusionInference:
         """Setup Intel RealSense cameras for left and right only (merged_1024)"""
         self.camera_configs = {
             "left_camera": IntelRealSenseCameraConfig(
-                serial_number=None,  # Will auto-detect or specify your left camera serial
+                serial_number="142422250807",
                 fps=30, 
                 width=640, 
                 height=480,
@@ -167,12 +167,13 @@ class FrankaDiffusionInference:
                 mock=False
             ),
             "right_camera": IntelRealSenseCameraConfig(
-                serial_number=None,  # Will auto-detect or specify your right camera serial  
+                serial_number="025522060843",  
                 fps=30, 
                 width=640, 
                 height=480,
                 use_depth=True,
-                mock=False
+                mock=False,
+                rotation=90
             ),
         }
         
