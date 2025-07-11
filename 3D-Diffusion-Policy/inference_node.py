@@ -26,7 +26,7 @@ from train_modified import TrainDP3Workspace
 from diffusion_policy_3d.dataset.franka_dataset import FrankaDataset
 from intelrealsense import IntelRealSenseCamera, IntelRealSenseCameraConfig
 
-FREQUENCY = 10.0  # Inference frequency (Hz)
+FREQUENCY = 60.0  # Inference frequency (Hz)
 
 class FrankaDiffusionInference:
     def __init__(self, 
@@ -81,11 +81,8 @@ class FrankaDiffusionInference:
         """Initialize connection to Franka robot using Franky"""
         try:
             self.robot = Robot(self.robot_ip)
-            self.robot.set_default_behavior()
             print(f"Connected to Franka robot at {self.robot_ip}")
             
-            # Enable the robot
-            self.robot.automatic_error_recovery()
             
         except Exception as e:
             print(f"Failed to connect to Franka robot: {e}")
@@ -100,7 +97,7 @@ class FrankaDiffusionInference:
             
             # Get gripper position (assuming you have gripper setup)
             # gripper_width = self.robot.gripper.width()  # Uncomment if gripper available
-            gripper_width = 0.04  # Default gripper width for now
+            gripper_width = 0.00  # Default gripper width for now
             
             with self.lock:
                 self.joint_state = joint_positions.tolist()
@@ -124,19 +121,22 @@ class FrankaDiffusionInference:
             for camera_name, camera_config in camera_data.items():
                 # Load extrinsics (transformation from camera to base frame)
                 if 'extrinsics' in camera_config:
-                    extrinsic_data = camera_config['extrinsics']
-                    # Convert from [x, y, z, qx, qy, qz, qw] to 4x4 transformation matrix
-                    translation = np.array(extrinsic_data[:3])
-                    quaternion = np.array(extrinsic_data[3:7])  # [qx, qy, qz, qw]
-                    
-                    # Create transformation matrix
-                    rotation_matrix = R.from_quat(quaternion).as_matrix()
-                    transform = np.eye(4)
-                    transform[:3, :3] = rotation_matrix
-                    transform[:3, 3] = translation
-                    
-                    self.extrinsics[camera_name] = transform
-                
+                    extrinsics = camera_config['extrinsics']
+                    if 'SE3' in extrinsics:
+                        # Use SE3 4x4 matrix directly
+                        transform = np.array(extrinsics['SE3'])
+                        self.extrinsics[camera_name] = transform
+                    else:
+                        # Fallback: try to load as [x, y, z, qx, qy, qz, qw]
+                        extrinsic_data = extrinsics
+                        if isinstance(extrinsic_data, list) and len(extrinsic_data) == 7:
+                            translation = np.array(extrinsic_data[:3])
+                            quaternion = np.array(extrinsic_data[3:7])  # [qx, qy, qz, qw]
+                            rotation_matrix = R.from_quat(quaternion).as_matrix()
+                            transform = np.eye(4)
+                            transform[:3, :3] = rotation_matrix
+                            transform[:3, 3] = translation
+                            self.extrinsics[camera_name] = transform
                 # Load intrinsics
                 if 'intrinsics' in camera_config:
                     intrinsics = camera_config['intrinsics']
@@ -189,11 +189,11 @@ class FrankaDiffusionInference:
     def load_model(self, config_path, s3_bucket, latest, epoch, restore_checkpoint):
         """Load the 3D Diffusion Policy model"""
         try:
-            # Get S3 checkpoint path
+            # Get checkpoint path
             if latest:
-                s3_path = "DP3_outputs/latest/checkpoint.pth"
+                checkpoint_name = "checkpoint_latest.pth"
             elif epoch is not None:
-                s3_path = f"DP3_outputs/epoch_{epoch}/checkpoint.pth"
+                checkpoint_name = f"checkpoint_epoch_{epoch}.pth"
             else:
                 raise ValueError("Either latest must be True or epoch must be specified")
             
@@ -212,14 +212,24 @@ class FrankaDiffusionInference:
             self.workspace = TrainDP3Workspace(self.cfg)
             
             # Load checkpoint from S3 or local cache
-            s3_client = boto3.client('s3')
-            local_path = 'checkpoint_latest.pth'
-
-            if restore_checkpoint and os.path.exists(local_path):
-                print(f"Restoring from local checkpoint: {local_path}")
+            local_path = checkpoint_name
+            
+            if s3_bucket and s3_bucket.lower() != "null":
+                s3_client = boto3.client('s3')
+                if latest:
+                    s3_path = "DP3_outputs/latest/checkpoint.pth"
+                else:
+                    s3_path = f"DP3_outputs/epoch_{epoch}/checkpoint.pth"
+                
+                if restore_checkpoint and os.path.exists(local_path):
+                    print(f"Loading checkpoint from local cache: {local_path}")
+                else:
+                    print(f"Downloading checkpoint from S3: {s3_bucket}/{s3_path}")
+                    s3_client.download_file(s3_bucket, s3_path, local_path)
             else:
-                print(f"Downloading checkpoint from s3://{s3_bucket}/{s3_path}")
-                s3_client.download_file(s3_bucket, s3_path, local_path)
+                print(f"S3 bucket not provided, loading checkpoint locally from: {local_path}")
+                if not os.path.exists(local_path):
+                    raise FileNotFoundError(f"Local checkpoint file not found: {local_path}")
             
             # Load checkpoint
             ckpt = torch.load(local_path, map_location=self.device, weights_only=False)
@@ -302,9 +312,6 @@ class FrankaDiffusionInference:
             rs_intrinsics.ppy = cy
             rs_intrinsics.model = rs.distortion.brown_conrady
             rs_intrinsics.coeffs = [0, 0, 0, 0, 0]  # No distortion
-            
-            # Convert depth to RealSense depth frame
-            depth_frame = rs.depth_frame()
             
             # Manual point cloud generation (RealSense way)
             points = []
@@ -535,8 +542,8 @@ class FrankaDiffusionInference:
             # Send joint commands to robot
             try:
                 # Move to joint position
-                self.robot.move(JointMotion(joint_actions.tolist()))
-
+                print(f"Moving robot to joint positions: {joint_actions.tolist()}")
+                self.robot.move(JointMotion(joint_actions.tolist() , relative_dynamics_factor=0.01))  # Example relative dynamics factor
                 
                 # Control gripper (if available)
                 # if hasattr(self.robot, 'gripper'):
@@ -609,8 +616,9 @@ class FrankaDiffusionInference:
                 
                 # Maintain target frequency
                 elapsed_time = time.time() - start_time
+                print(f"Elapsed time for step: {elapsed_time:.3f} seconds")
                 sleep_time = max(0, (1.0 / FREQUENCY) - elapsed_time)
-                time.sleep(sleep_time)
+                # time.sleep(sleep_time)
                 
         except KeyboardInterrupt:
             print("Stopping inference loop...")
