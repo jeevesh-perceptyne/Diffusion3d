@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState, PointCloud2
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float32MultiArray, Header
+import sensor_msgs_py.point_cloud2 as pc2
+
 import cv2
 import numpy as np
 import threading
@@ -16,7 +23,6 @@ from termcolor import cprint
 import hydra
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
-from franky import Affine, Robot ,JointMotion
 
 # Add the project path
 sys.path.append('/mnt/data/Diffusion3d/3D-Diffusion-Policy')
@@ -28,11 +34,10 @@ from intelrealsense import IntelRealSenseCamera, IntelRealSenseCameraConfig
 
 FREQUENCY = 10.0  # Inference frequency (Hz)
 
-class FrankaDiffusionInference:
+class FrankaDiffusionInferenceNode(Node):
     def __init__(self, 
                  config_path: str,
                  cameras_config_path: str,
-                 robot_ip: str = "172.16.0.2",
                  s3_bucket: str = "pr-checkpoints",
                  latest: bool = True,
                  epoch: int = None,
@@ -40,18 +45,18 @@ class FrankaDiffusionInference:
                  use_ema: bool = False,
                  restore_checkpoint: bool = True,
                  workspace_bounds: list = None):
+        super().__init__('franka_diffusion_inference_node')
         
         self.device = device
         self.use_ema = use_ema
         self.cameras_config_path = cameras_config_path
-        self.robot_ip = robot_ip
         
         # Workspace bounds for point cloud cropping
         if workspace_bounds is None:
             self.workspace_bounds = [
-                [-0.1, 0.8],  # X bounds (meters)
-                [-0.4, 0.5],  # Y bounds (meters)  
-                [-0.2, 0.8]    # Z bounds (meters)
+                [-0.3, 0.7],  # X bounds (meters)
+                [-0.5, 0.5],  # Y bounds (meters)  
+                [0.0, 0.8]    # Z bounds (meters)
             ]
         else:
             self.workspace_bounds = workspace_bounds
@@ -65,9 +70,6 @@ class FrankaDiffusionInference:
         self.observation_history = []
         self.max_history_length = 10  # Will be set from config
         
-        # Initialize Franka robot
-        self.setup_robot()
-        
         # Load camera extrinsics and setup cameras
         self.load_camera_config()
         self.setup_cameras()
@@ -75,42 +77,44 @@ class FrankaDiffusionInference:
         # Load model
         self.load_model(config_path, s3_bucket, latest, epoch, restore_checkpoint)
         
-        print("Franka Diffusion Policy inference node started.")
+        # ROS2 subscribers
+        self.joint_state_subscriber = self.create_subscription(
+            JointState,
+            "/joint_states",  # Adjust topic name as needed
+            self.joint_state_callback,
+            10
+        )
         
-    def setup_robot(self):
-        """Initialize connection to Franka robot using Franky"""
-        try:
-            self.robot = Robot(self.robot_ip)
-            self.robot.set_default_behavior()
-            print(f"Connected to Franka robot at {self.robot_ip}")
-            
-            # Enable the robot
-            self.robot.automatic_error_recovery()
-            
-        except Exception as e:
-            print(f"Failed to connect to Franka robot: {e}")
-            raise
-            
-    def get_robot_state(self):
-        """Get current robot joint states and gripper position"""
-        try:
-            # Get joint positions
-            robot_state = self.robot.state
-            joint_positions = robot_state.q  # Joint positions [7]
-            
-            # Get gripper position (assuming you have gripper setup)
-            # gripper_width = self.robot.gripper.width()  # Uncomment if gripper available
-            gripper_width = 0.04  # Default gripper width for now
-            
-            with self.lock:
-                self.joint_state = joint_positions.tolist()
-                self.gripper_state = [gripper_width]
-                
-            return True
-            
-        except Exception as e:
-            print(f"Failed to read robot state: {e}")
-            return False
+        self.gripper_state_subscriber = self.create_subscription(
+            JointState,
+            "/gripper/joint_states",  # Adjust topic name as needed
+            self.gripper_state_callback,
+            10
+        )
+        
+        # ROS2 publishers
+        self.joint_action_pub = self.create_publisher(
+            JointState, 
+            '/diffusion_policy/joint_actions', 
+            10
+        )
+        
+        self.gripper_action_pub = self.create_publisher(
+            Float32MultiArray, 
+            '/diffusion_policy/gripper_action', 
+            10
+        )
+        
+        self.point_cloud_pub = self.create_publisher(
+            PointCloud2,
+            '/diffusion_policy/point_cloud',
+            10
+        )
+        
+        # Timer for inference loop
+        self.timer = self.create_timer(1.0 / FREQUENCY, self.inference_step)
+        
+        self.get_logger().info("Franka Diffusion Policy inference node started.")
         
     def load_camera_config(self):
         """Load camera configuration (intrinsics and extrinsics) from JSON file"""
@@ -147,10 +151,10 @@ class FrankaDiffusionInference:
                         'cy': intrinsics['cy']
                     }
             
-            print(f"Loaded camera config for {len(self.extrinsics)} cameras")
+            self.get_logger().info(f"Loaded camera config for {len(self.extrinsics)} cameras")
             
         except Exception as e:
-            print(f"Failed to load camera config: {e}")
+            self.get_logger().error(f"Failed to load camera config: {e}")
             # Use default extrinsics if config loading fails
             self.extrinsics = {}
             self.camera_intrinsics = {}
@@ -181,9 +185,9 @@ class FrankaDiffusionInference:
             try:
                 self.cameras[name] = IntelRealSenseCamera(cfg)
                 self.cameras[name].connect()
-                print(f"Connected to camera {name}")
+                self.get_logger().info(f"Connected to camera {name}")
             except Exception as e:
-                print(f"Failed to connect camera {name}: {e}")
+                self.get_logger().error(f"Failed to connect camera {name}: {e}")
                 
     def load_model(self, config_path, s3_bucket, latest, epoch, restore_checkpoint):
         """Load the 3D Diffusion Policy model"""
@@ -215,9 +219,9 @@ class FrankaDiffusionInference:
             local_path = 'checkpoint_latest.pth'
 
             if restore_checkpoint and os.path.exists(local_path):
-                print(f"Restoring from local checkpoint: {local_path}")
+                self.get_logger().info(f"Restoring from local checkpoint: {local_path}")
             else:
-                print(f"Downloading checkpoint from s3://{s3_bucket}/{s3_path}")
+                self.get_logger().info(f"Downloading checkpoint from s3://{s3_bucket}/{s3_path}")
                 s3_client.download_file(s3_bucket, s3_path, local_path)
             
             # Load checkpoint
@@ -242,12 +246,24 @@ class FrankaDiffusionInference:
             if self.workspace.ema_model is not None:
                 self.workspace.ema_model.eval()
             
-            print(f"Loaded checkpoint from epoch {ckpt['epoch']}")
+            self.get_logger().info(f"Loaded checkpoint from epoch {ckpt['epoch']}")
             
         except Exception as e:
-            print(f"Error loading model: {e}")
+            self.get_logger().error(f"Error loading model: {e}")
             raise
             
+    def joint_state_callback(self, msg: JointState):
+        """Callback for joint state updates"""
+        with self.lock:
+            if len(msg.position) >= 7:  # Ensure we have at least 7 joint positions
+                self.joint_state = list(msg.position[:7])  # Take first 7 joints
+            
+    def gripper_state_callback(self, msg: JointState):
+        """Callback for gripper state updates"""
+        with self.lock:
+            if len(msg.position) > 0:
+                self.gripper_state = [msg.position[0]]  # Take first gripper position
+                
     def get_current_images_and_point_clouds(self):
         """Get current images and point clouds from left and right cameras only"""
         images = {}
@@ -271,7 +287,7 @@ class FrankaDiffusionInference:
                             point_clouds.append(pcd)
                             
                 except Exception as e:
-                    print(f"Failed to read from camera {name}: {e}")
+                    self.get_logger().warning(f"Failed to read from camera {name}: {e}")
                 
         return images, point_clouds
         
@@ -288,7 +304,7 @@ class FrankaDiffusionInference:
                 fx = fy = 525.0
                 cx = depth_map.shape[1] / 2
                 cy = depth_map.shape[0] / 2
-                print(f"Using default intrinsics for {camera_name}")
+                self.get_logger().warning(f"Using default intrinsics for {camera_name}")
             
             # Create RealSense intrinsics object
             height, width = depth_map.shape
@@ -337,12 +353,12 @@ class FrankaDiffusionInference:
                 v_transformed = (transform @ v_homogeneous.T).T
                 v = v_transformed[:, :3]
             else:
-                print(f"No extrinsics found for {camera_name}, using camera frame")
+                self.get_logger().warning(f"No extrinsics found for {camera_name}, using camera frame")
             
             return v
             
         except Exception as e:
-            print(f"Failed to convert depth to point cloud with RealSense: {e}")
+            self.get_logger().warning(f"Failed to convert depth to point cloud with RealSense: {e}")
             return None
             
     def crop_workspace(self, points):
@@ -397,7 +413,7 @@ class FrankaDiffusionInference:
             cropped_pcd = self.crop_workspace(merged_pcd)
             
             if len(cropped_pcd) == 0:
-                print("No points left after workspace cropping")
+                self.get_logger().warning("No points left after workspace cropping")
                 return np.zeros((1024, 3))  # Return dummy points
             
             # Target is 1024 points for merged_1024 dataset type
@@ -424,7 +440,7 @@ class FrankaDiffusionInference:
             return sampled_pcd
             
         except Exception as e:
-            print(f"Failed to merge point clouds: {e}")
+            self.get_logger().warning(f"Failed to merge point clouds: {e}")
             return None
             
     def create_observation(self):
@@ -519,11 +535,11 @@ class FrankaDiffusionInference:
             return pred_action.cpu().numpy()
             
         except Exception as e:
-            print(f"Inference failed: {e}")
+            self.get_logger().error(f"Inference failed: {e}")
             return None
             
-    def send_actions(self, actions):
-        """Send predicted actions to Franka robot"""
+    def publish_actions(self, actions):
+        """Publish predicted actions"""
         try:
             # Take the first action from the predicted sequence
             action = actions[0, 0, :]  # [8] - first batch, first timestep
@@ -531,43 +547,45 @@ class FrankaDiffusionInference:
             joint_actions = action[:7]  # First 7 elements are joint actions
             gripper_action = action[7]  # Last element is gripper action
             
-            # Send joint commands to robot
-            try:
-                # Move to joint position
-                self.robot.move(JointMotion(joint_actions.tolist()))
-
-                
-                # Control gripper (if available)
-                # if hasattr(self.robot, 'gripper'):
-                #     self.robot.gripper.move(gripper_action)
-                
-                print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
-                
-            except Exception as e:
-                print(f"Failed to send joint commands: {e}")
-                
-        except Exception as e:
-            print(f"Failed to process actions: {e}")
+            # Publish joint actions
+            joint_msg = JointState()
+            joint_msg.header.stamp = self.get_clock().now().to_msg()
+            joint_msg.header.frame_id = "base_link"
+            joint_msg.name = [f'joint_{i+1}' for i in range(7)]
+            joint_msg.position = joint_actions.tolist()
+            self.joint_action_pub.publish(joint_msg)
             
-    def save_point_cloud(self, point_cloud, filename=None):
-        """Save point cloud to file for debugging/visualization"""
+            # Publish gripper action
+            gripper_msg = Float32MultiArray()
+            gripper_msg.data = [float(gripper_action)]
+            self.gripper_action_pub.publish(gripper_msg)
+            
+            self.get_logger().info(f"Published actions - Joints: {joint_actions}, Gripper: {gripper_action}")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish actions: {e}")
+            
+    def publish_point_cloud(self, point_cloud):
+        """Publish point cloud for visualization"""
         try:
-            if filename is None:
-                filename = f"point_cloud_{int(time.time())}.npy"
+            header = Header()
+            header.stamp = self.get_clock().now().to_msg()
+            header.frame_id = "base_link"
             
-            np.save(filename, point_cloud)
-            print(f"Saved point cloud to {filename}")
+            # Convert numpy array to PointCloud2 message
+            points_list = []
+            for point in point_cloud:
+                points_list.append([float(point[0]), float(point[1]), float(point[2])])
+                
+            point_cloud_msg = pc2.create_cloud_xyz32(header, points_list)
+            self.point_cloud_pub.publish(point_cloud_msg)
             
         except Exception as e:
-            print(f"Failed to save point cloud: {e}")
+            self.get_logger().warning(f"Failed to publish point cloud: {e}")
             
     def inference_step(self):
-        """Main inference loop"""
+        """Main inference loop called by timer"""
         try:
-            # Read current robot state
-            if not self.get_robot_state():
-                return
-                
             # Create observation from current sensor data
             obs = self.create_observation()
             if obs is None:
@@ -586,66 +604,32 @@ class FrankaDiffusionInference:
             if actions is None:
                 return
                 
-            # Send actions to robot
-            self.send_actions(actions)
+            # Publish actions
+            self.publish_actions(actions)
             
-            # Save point cloud for debugging (optional)
-            # self.save_point_cloud(obs['point_cloud'])
-            
-        except Exception as e:
-            print(f"Error in inference step: {e}")
-            
-    def run(self):
-        """Run the inference loop"""
-        try:
-            print("Starting inference loop...")
-            
-            while True:
-                start_time = time.time()
-                
-                # Run inference step
-                self.inference_step()
-                
-                # Maintain target frequency
-                elapsed_time = time.time() - start_time
-                sleep_time = max(0, (1.0 / FREQUENCY) - elapsed_time)
-                time.sleep(sleep_time)
-                
-        except KeyboardInterrupt:
-            print("Stopping inference loop...")
-        except Exception as e:
-            print(f"Error in inference loop: {e}")
-        finally:
-            self.cleanup()
-            
-    def cleanup(self):
-        """Cleanup resources"""
-        try:
-            # Disconnect cameras
-            for cam in self.cameras.values():
-                try:
-                    cam.disconnect()
-                except Exception as e:
-                    print(f"Failed to disconnect camera: {e}")
-                    
-            # Stop robot (optional - robot will maintain last position)
-            # self.robot.stop()
-            
-            print("Cleanup completed")
+            # Publish point cloud for visualization
+            self.publish_point_cloud(obs['point_cloud'])
             
         except Exception as e:
-            print(f"Error during cleanup: {e}")
+            self.get_logger().error(f"Error in inference step: {e}")
+            
+    def destroy_node(self):
+        """Cleanup when node is destroyed"""
+        for cam in self.cameras.values():
+            try:
+                cam.disconnect()
+            except Exception as e:
+                self.get_logger().warning(f"Failed to disconnect camera: {e}")
+        super().destroy_node()
 
 
 def main(args=None):
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Franka 3D Diffusion Policy Inference")
+    parser = argparse.ArgumentParser(description="Franka 3D Diffusion Policy Inference Node")
     parser.add_argument("--config_path", type=str, required=True,
                         help="Path to the config file used for training")
     parser.add_argument("--cameras_config_path", type=str, required=True,
                         help="Path to cameras.json file with intrinsics and extrinsics")
-    parser.add_argument("--robot_ip", type=str, default="172.16.0.2",
-                        help="IP address of the Franka robot")
     parser.add_argument("--s3_bucket", type=str, default="pr-checkpoints",
                         help="S3 bucket containing the checkpoint")
     parser.add_argument("--latest", action="store_true", default=True,
@@ -661,7 +645,7 @@ def main(args=None):
     parser.add_argument("--workspace_bounds", nargs=6, type=float, default=None,
                         help="Workspace bounds as x_min x_max y_min y_max z_min z_max")
     
-    parsed_args = parser.parse_args(args)
+    parsed_args, unknown = parser.parse_known_args(args)
     
     # Parse workspace bounds
     workspace_bounds = None
@@ -672,11 +656,13 @@ def main(args=None):
             [parsed_args.workspace_bounds[4], parsed_args.workspace_bounds[5]]
         ]
     
-    # Create and run the inference system
-    inference_system = FrankaDiffusionInference(
+    # Initialize ROS2
+    rclpy.init(args=unknown)
+    
+    # Create and run the node
+    node = FrankaDiffusionInferenceNode(
         config_path=parsed_args.config_path,
         cameras_config_path=parsed_args.cameras_config_path,
-        robot_ip=parsed_args.robot_ip,
         s3_bucket=parsed_args.s3_bucket,
         latest=parsed_args.latest,
         epoch=parsed_args.epoch,
@@ -686,8 +672,13 @@ def main(args=None):
         workspace_bounds=workspace_bounds
     )
     
-    # Run the inference loop
-    inference_system.run()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
