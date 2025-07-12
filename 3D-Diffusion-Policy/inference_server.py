@@ -8,6 +8,7 @@ import numpy as np
 import argparse
 import os
 import sys
+import traceback
 import boto3
 import hydra
 from omegaconf import OmegaConf
@@ -80,8 +81,28 @@ class DiffusionPolicyServer:
                 self.workspace.ema_model.load_state_dict(ckpt['ema_state_dict'])
             
             # Load normalizer state (essential for proper inference)
+            normalizer_loaded = False
             if hasattr(self.workspace.model, 'normalizer') and 'normalizer_state_dict' in ckpt:
                 self.workspace.model.normalizer.load_state_dict(ckpt['normalizer_state_dict'])
+                normalizer_loaded = True
+                print("Loaded normalizer from checkpoint")
+            elif hasattr(self.workspace, 'normalizer') and 'normalizer_state_dict' in ckpt:
+                self.workspace.normalizer.load_state_dict(ckpt['normalizer_state_dict'])
+                normalizer_loaded = True
+                print("Loaded normalizer from workspace")
+            else:
+                print("Warning: No normalizer found in checkpoint - inference may be incorrect!")
+            
+            # Store normalizer for easy access
+            if normalizer_loaded:
+                if hasattr(self.workspace.model, 'normalizer'):
+                    self.normalizer = self.workspace.model.normalizer
+                elif hasattr(self.workspace, 'normalizer'):
+                    self.normalizer = self.workspace.normalizer
+                else:
+                    self.normalizer = None
+            else:
+                self.normalizer = None
             
             # Move models to device
             self.workspace.model.to(self.device)
@@ -100,29 +121,61 @@ class DiffusionPolicyServer:
             raise
             
     def run_inference(self, obs_dict):
-        """Run inference with the diffusion policy model"""
+        """Run inference with the diffusion policy model - MATCH TRAINING EXACTLY"""
         try:
+            # Debug: Print input shapes
+            print(f"Input shapes - point_cloud: {obs_dict['point_cloud'].shape}, agent_pos: {obs_dict['agent_pos'].shape}")
+            
             # Convert numpy arrays to torch tensors if needed
             if isinstance(obs_dict['point_cloud'], np.ndarray):
                 obs_dict['point_cloud'] = torch.from_numpy(obs_dict['point_cloud']).float().to(self.device)
             if isinstance(obs_dict['agent_pos'], np.ndarray):
                 obs_dict['agent_pos'] = torch.from_numpy(obs_dict['agent_pos']).float().to(self.device)
             
+            print(f"Converted to tensors - point_cloud: {obs_dict['point_cloud'].shape}, agent_pos: {obs_dict['agent_pos'].shape}")
+            
+            # Apply normalization exactly like during training
+            obs_dict_normalized = dict()
+            if hasattr(self.workspace.model, 'normalizer') and self.workspace.model.normalizer is not None:
+                print("Applying normalizer from model")
+                # Normalize using the model's normalizer (loaded from checkpoint)
+                normalizer = self.workspace.model.normalizer
+                obs_dict_normalized['agent_pos'] = normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
+                obs_dict_normalized['point_cloud'] = normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
+            elif hasattr(self, 'normalizer') and self.normalizer is not None:
+                print("Applying normalizer from server")
+                # Use server normalizer if available
+                obs_dict_normalized['agent_pos'] = self.normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
+                obs_dict_normalized['point_cloud'] = self.normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
+            else:
+                print("WARNING: No normalizer found, using raw observations")
+                obs_dict_normalized = obs_dict
+            
+            # Create the obs dict in the format expected by the model
+            formatted_obs = {
+                'obs': obs_dict_normalized
+            }
+            
             # Select the appropriate model
             if self.use_ema and self.workspace.ema_model is not None:
                 policy = self.workspace.ema_model
+                print("Using EMA model for inference")
             else:
                 policy = self.workspace.model
+                print("Using main model for inference")
                 
             # Run inference
             with torch.no_grad():
-                result = policy.predict_action(obs_dict)
-                pred_action = result['action_pred']  # [1, horizon, 8]
+                result = policy.predict_action(formatted_obs)
+                pred_action = result['action_pred']  # [batch, horizon, action_dim]
                 
+            print(f"Action prediction shape: {pred_action.shape}")
             return pred_action.cpu().numpy()
             
         except Exception as e:
             print(f"Inference failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 def handle_client(conn, server_instance):
@@ -142,6 +195,21 @@ def handle_client(conn, server_instance):
         obs_dict = pickle.loads(data)
         print(f"Received observation with shapes: point_cloud={obs_dict['point_cloud'].shape}, agent_pos={obs_dict['agent_pos'].shape}")
         
+        # Validate input shapes - more flexible validation
+        batch_size, time_steps = obs_dict['point_cloud'].shape[:2]
+        num_points = obs_dict['point_cloud'].shape[2] if len(obs_dict['point_cloud'].shape) > 2 else obs_dict['point_cloud'].shape[1]
+        
+        print(f"Input validation: batch={batch_size}, time_steps={time_steps}, points={num_points}")
+        
+        if obs_dict['point_cloud'].shape[-1] != 3:
+            raise ValueError(f"Point cloud should have 3 coordinates (x,y,z), got {obs_dict['point_cloud'].shape[-1]}")
+        
+        if num_points != 1024:
+            print(f"Warning: Expected 1024 points, got {num_points}")
+            
+        if obs_dict['agent_pos'].shape[-1] != 8:
+            raise ValueError(f"Agent position should have 8 dimensions, got {obs_dict['agent_pos'].shape[-1]}")
+        
         # Run inference
         actions = server_instance.run_inference(obs_dict)
         
@@ -157,6 +225,8 @@ def handle_client(conn, server_instance):
         
     except Exception as e:
         print(f"Error handling client: {e}")
+        import traceback
+        traceback.print_exc()
         # Send error response
         try:
             response = pickle.dumps(None)

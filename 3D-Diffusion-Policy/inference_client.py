@@ -37,12 +37,13 @@ class FrankaDiffusionClient:
         self.robot_ip = robot_ip
         self.max_history_length = max_history_length
         
-        # Workspace bounds for point cloud cropping
+        # Workspace bounds for point cloud cropping - MATCH TRAINING DATA EXACTLY
         if workspace_bounds is None:
+            # Use exact same bounds as training data conversion script
             self.workspace_bounds = [
-                [-0.1, 0.8],  # X bounds (meters)
-                [-0.35, 0.3],  # Y bounds (meters)  
-                [-0.1, 0.8]   # Z bounds (meters)
+                [0.3, 1.0],   # x: forward/backward from robot base
+                [-0.5, 0.5],  # y: left/right from robot base  
+                [-0.1, 0.8]   # z: up/down from robot base
             ]
         else:
             self.workspace_bounds = workspace_bounds
@@ -141,10 +142,10 @@ class FrankaDiffusionClient:
             self.camera_intrinsics = {}
         
     def setup_cameras(self):
-        """Setup Intel RealSense cameras for left and right only (merged_1024)"""
+        """Setup Intel RealSense cameras - MATCH RECORDING SCRIPT EXACTLY"""
         self.camera_configs = {
             "left_camera": IntelRealSenseCameraConfig(
-                serial_number="142422250807",
+                serial_number="142422250807",  # Match recording script
                 fps=30, 
                 width=640, 
                 height=480,
@@ -152,13 +153,12 @@ class FrankaDiffusionClient:
                 mock=False
             ),
             "right_camera": IntelRealSenseCameraConfig(
-                serial_number="025522060843",  
+                serial_number="025522060843",  # Match recording script
                 fps=30, 
                 width=640, 
                 height=480,
                 use_depth=True,
                 mock=False
-                # rotation=90
             ),
         }
         
@@ -167,28 +167,29 @@ class FrankaDiffusionClient:
             try:
                 self.cameras[name] = IntelRealSenseCamera(cfg)
                 self.cameras[name].connect()
-                print(f"Connected to camera {name}")
+                self.cameras[name].async_read()  # Start async reading like recording
+                print(f"Connected to camera {name} (serial: {cfg.serial_number})")
             except Exception as e:
                 print(f"Failed to connect camera {name}: {e}")
                 
     def get_current_images_and_point_clouds(self):
-        """Get current images and point clouds from left and right cameras only"""
+        """Get current images and point clouds from left and right cameras - MATCH RECORDING"""
         images = {}
         point_clouds = []
         
-        # Only process left and right cameras for merged_1024
+        # Only process left and right cameras for merged_1024 (same as training)
         target_cameras = ["left_camera", "right_camera"]
         
         for name in target_cameras:
             if name in self.cameras:
                 try:
-                    # Read color and depth from camera
-                    color_img, depth_map = self.cameras[name].read()
+                    # Read color and depth from camera - SAME METHOD AS RECORDING
+                    color_img, depth_map = self.cameras[name].async_read()
                     
                     if color_img is not None and depth_map is not None:
                         images[name] = color_img.copy()
                         
-                        # Convert depth to point cloud using RealSense
+                        # Convert depth to point cloud using EXACT SAME METHOD as training conversion
                         pcd = self.depth_to_point_cloud_rs(color_img, depth_map, name)
                         if pcd is not None and len(pcd) > 0:
                             point_clouds.append(pcd)
@@ -199,9 +200,9 @@ class FrankaDiffusionClient:
         return images, point_clouds
         
     def depth_to_point_cloud_rs(self, color_img, depth_map, camera_name):
-        """Convert depth map to point cloud using RealSense and transform to world frame"""
+        """Convert depth map to point cloud using same method as training data conversion"""
         try:
-            # Get camera intrinsics
+            # Get camera intrinsics - match training data exactly
             if camera_name in self.camera_intrinsics:
                 intrinsics = self.camera_intrinsics[camera_name]
                 fx, fy = intrinsics['fx'], intrinsics['fy']
@@ -213,65 +214,56 @@ class FrankaDiffusionClient:
                 cy = depth_map.shape[0] / 2
                 print(f"Using default intrinsics for {camera_name}")
             
-            # Create RealSense intrinsics object
+            # Get image dimensions
             height, width = depth_map.shape
-            rs_intrinsics = rs.intrinsics()
-            rs_intrinsics.width = width
-            rs_intrinsics.height = height
-            rs_intrinsics.fx = fx
-            rs_intrinsics.fy = fy
-            rs_intrinsics.ppx = cx
-            rs_intrinsics.ppy = cy
-            rs_intrinsics.model = rs.distortion.brown_conrady
-            rs_intrinsics.coeffs = [0, 0, 0, 0, 0]  # No distortion
             
-            # Manual point cloud generation (RealSense way)
-            points = []
-            for y in range(height):
-                for x in range(width):
-                    depth_value = depth_map[y, x]
-                    if depth_value > 0:  # Valid depth
-                        # Convert to 3D point using RealSense deproject
-                        point = rs.rs2_deproject_pixel_to_point(rs_intrinsics, [x, y], depth_value / 1000.0)
-                        points.append(point)
-            # add clor using color image
-            if color_img is not None and len(points) > 0:
-                color_points = []
-                for i, point in enumerate(points):
-                    if i < color_img.shape[0] * color_img.shape[1]:
-                        color = color_img[i // width, i % width]
-                        color_points.append([point[0], point[1], point[2], color[0], color[1], color[2]])
-                points = color_points
+            # Create coordinate grids - same as training conversion
+            u, v = np.meshgrid(np.arange(width), np.arange(height))
+            
+            # Convert depth to meters - MATCH TRAINING DATA SCALING EXACTLY
+            if 'wrist' in camera_name.lower():
+                depth_m = depth_map.astype(np.float32) / 10000.0  # Wrist camera scaling
             else:
-                print(f"No color image available for {camera_name}, using depth points only")
-            if len(points) == 0:
-                return None
-                
-            # Convert to numpy array
-            v = np.array(points)
+                depth_m = depth_map.astype(np.float32) / 1000.0   # Left/right camera scaling
             
-            # Filter out far points
-            valid_mask = (v[:, 2] > 0) & (v[:, 2] < 5.0)
-            v = v[valid_mask]
+            # Remove invalid depth values - same thresholds as training
+            valid_mask = (depth_m > 0) & (depth_m < 5.0)
             
-            if len(v) == 0:
+            if np.sum(valid_mask) == 0:
+                print(f"No valid depth pixels for {camera_name}")
                 return None
             
-            # Transform to world frame using extrinsics
+            # Convert to 3D points in camera frame - SAME METHOD AS TRAINING
+            x = (u - cx) * depth_m / fx
+            y = (v - cy) * depth_m / fy
+            z = depth_m
+            
+            # Apply valid mask
+            x = x[valid_mask]
+            y = y[valid_mask]
+            z = z[valid_mask]
+            
+            # Stack XYZ coordinates
+            points_3d = np.stack([x, y, z], axis=1)
+            
+            # Transform to world frame using extrinsics - same as training
             if camera_name in self.extrinsics:
                 transform = self.extrinsics[camera_name]
-                # Only use xyz for transformation
-                v_xyz = v[:, :3] if v.shape[1] > 3 else v
-                v_homogeneous = np.hstack([v_xyz, np.ones((v_xyz.shape[0], 1))])
-                v_transformed = (transform @ v_homogeneous.T).T
-                v = v_transformed[:, :3]
+                # Add homogeneous coordinate
+                ones = np.ones((points_3d.shape[0], 1))
+                points_homogeneous = np.hstack([points_3d, ones])
+                # Transform points
+                points_transformed = (transform @ points_homogeneous.T).T
+                points_3d = points_transformed[:, :3]  # Remove homogeneous coordinate
             else:
                 print(f"No extrinsics found for {camera_name}, using camera frame")
             
-            return v
+            return points_3d
             
         except Exception as e:
-            print(f"Failed to convert depth to point cloud with RealSense: {e}")
+            print(f"Failed to convert depth to point cloud: {e}")
+            import traceback
+            traceback.print_exc()
             return None
             
     def crop_workspace(self, points):
@@ -292,26 +284,34 @@ class FrankaDiffusionClient:
         return points[mask]
     
     def farthest_point_sampling(self, points, num_points):
-        """Farthest Point Sampling (FPS) to downsample point cloud"""
+        """Farthest Point Sampling (FPS) to downsample point cloud - match training exactly"""
         if len(points) <= num_points:
-            return points
+            # If we have fewer points than desired, pad with duplicates
+            if len(points) == 0:
+                return np.zeros((num_points, 3))
+            padding_needed = num_points - len(points)
+            repeat_indices = np.random.choice(len(points), padding_needed, replace=True)
+            padding_points = points[repeat_indices]
+            return np.concatenate([points, padding_points], axis=0)
             
-        # Simple FPS implementation
-        sampled_indices = [0]  # Start with first point
-        distances = np.full(len(points), np.inf)
-        
-        for _ in range(num_points - 1):
-            # Update distances to nearest sampled point
-            last_idx = sampled_indices[-1]
-            last_point = points[last_idx]
-            new_distances = np.linalg.norm(points - last_point, axis=1)
-            distances = np.minimum(distances, new_distances)
+        try:
+            # Try PyTorch3D FPS (same as training)
+            import torch
+            import pytorch3d.ops as torch3d_ops
             
-            # Select point farthest from all sampled points
-            next_idx = np.argmax(distances)
-            sampled_indices.append(next_idx)
-        
-        return points[sampled_indices]
+            xyz_tensor = torch.from_numpy(points[:, :3]).float()
+            sampled_points, indices = torch3d_ops.sample_farthest_points(
+                points=xyz_tensor.unsqueeze(0), 
+                K=[num_points]
+            )
+            indices = indices.squeeze(0).numpy()
+            return points[indices]
+            
+        except (ImportError, Exception) as e:
+            # Fallback to random sampling if PyTorch3D not available or fails
+            print(f"PyTorch3D not available or failed ({e}), using random sampling")
+            indices = np.random.choice(len(points), num_points, replace=False)
+            return points[indices]
             
     def merge_point_clouds(self, point_clouds):
         """Merge multiple point clouds, crop workspace, and FPS to 1024 points"""
@@ -329,14 +329,14 @@ class FrankaDiffusionClient:
                 print("No points left after workspace cropping")
                 return np.zeros((1024, 3))  # Return dummy points
             
-            # Target is 1024 points for merged_1024 dataset type
+            # Target is exactly 1024 points to match training
             target_points = 1024
             
             if len(cropped_pcd) > target_points:
-                # Use Farthest Point Sampling
+                # Use Farthest Point Sampling - consistent with training
                 sampled_pcd = self.farthest_point_sampling(cropped_pcd, target_points)
             elif len(cropped_pcd) < target_points:
-                # Pad by repeating points
+                # Pad by repeating points - consistent with training
                 padding_needed = target_points - len(cropped_pcd)
                 repeat_indices = np.random.choice(len(cropped_pcd), padding_needed, replace=True)
                 padding_points = cropped_pcd[repeat_indices]
@@ -344,10 +344,15 @@ class FrankaDiffusionClient:
             else:
                 sampled_pcd = cropped_pcd
                 
+            # Ensure we have exactly 1024 points
+            assert sampled_pcd.shape[0] == 1024, f"Expected 1024 points, got {sampled_pcd.shape[0]}"
+            
             return sampled_pcd
             
         except Exception as e:
             print(f"Failed to merge point clouds: {e}")
+            import traceback
+            traceback.print_exc()
             return None
             
     def create_observation(self):
@@ -365,17 +370,21 @@ class FrankaDiffusionClient:
         
         # Merge point clouds
         merged_pcd = self.merge_point_clouds(point_clouds)
-        #save point cloud for debugging as pcd
-        import open3d as o3d
-        if merged_pcd is not None:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(merged_pcd)
-            o3d.io.write_point_cloud("merged_point_cloud.ply", pcd)
+        
+        # Debug: save point cloud for debugging (commented out for performance)
+        # if merged_pcd is not None:
+        #     try:
+        #         import open3d as o3d
+        #         pcd = o3d.geometry.PointCloud()
+        #         pcd.points = o3d.utility.Vector3dVector(merged_pcd)
+        #         o3d.io.write_point_cloud("merged_point_cloud.ply", pcd)
+        #     except ImportError:
+        #         pass
         
         if merged_pcd is None:
             return None
         
-        #if color points are available, convert to [N, 3] format by removing color
+        # Ensure point clouds are [N, 3] format (remove color if present)
         if merged_pcd.shape[1] == 6:  # [x, y, z, r, g, b]
             merged_pcd = merged_pcd[:, :3]
             
@@ -401,7 +410,7 @@ class FrankaDiffusionClient:
         if len(self.observation_history) == 0:
             return None
             
-        # Pad history if needed
+        # Pad history if needed - use exactly the required history length
         required_length = self.max_history_length
         current_length = len(self.observation_history)
         
@@ -421,14 +430,17 @@ class FrankaDiffusionClient:
             point_clouds.append(obs['point_cloud'])
             agent_poses.append(obs['agent_pos'])
             
-        # Convert to numpy arrays (will be converted to tensors on server)
+        # Convert to numpy arrays - match training data format exactly
         point_cloud_array = np.stack(point_clouds)  # [T, N, 3]
-        agent_pos_array = np.stack(agent_poses)     # [T, 8]
-        #negate y-axis of all point clouds
-        point_cloud_array[:, :, 1] *= -1  # Negate Y-axis for consistency
-        # Add batch dimension
+        agent_pos_array = np.stack(agent_poses)     # [T, D]
+        
+        # Ensure point clouds are exactly the right shape [T, 1024, 3]
+        if point_cloud_array.shape[1] != 1024:
+            print(f"Warning: point cloud has {point_cloud_array.shape[1]} points, expected 1024")
+        
+        # Add batch dimension to match training format
         point_cloud_array = np.expand_dims(point_cloud_array, axis=0)  # [1, T, N, 3]
-        agent_pos_array = np.expand_dims(agent_pos_array, axis=0)      # [1, T, 8]
+        agent_pos_array = np.expand_dims(agent_pos_array, axis=0)      # [1, T, D]
         
         obs_dict = {
             'point_cloud': point_cloud_array,
@@ -477,45 +489,35 @@ class FrankaDiffusionClient:
                 return
                 
             # Take the first action from the predicted sequence
-            action = actions[0, 0, :]  # [8] - first batch, first timestep
+            action = actions[0, 0, :]  # [action_dim] - first batch, first timestep
             
+            # Ensure we have the expected action dimension
+            if len(action) < 7:
+                print(f"Warning: action has {len(action)} dimensions, expected at least 7")
+                return
+                
             joint_actions = action[:7]  # First 7 elements are joint actions
-            gripper_action = action[7]  # Last element is gripper action
+            gripper_action = action[7] if len(action) > 7 else 0.0  # Last element is gripper action
             
             # Send joint commands to robot
             try:
-                # Move to joint position
-                # print(f"Moving robot to joint positions: {joint_actions.tolist()}")
+                # Move to joint position with appropriate dynamics
+                print(f"Moving robot to joint positions: {joint_actions.tolist()}")
                 self.robot.move(JointMotion(joint_actions.tolist(), relative_dynamics_factor=0.01))
                 
                 # Control gripper (if available)
                 # if hasattr(self.robot, 'gripper'):
                 #     self.robot.gripper.move(gripper_action)
                 
-                # print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
-            # actions = actions[0, 0, :]  # [8] - first batch, first timestep
-            # for action in actions:
-            #     joint_actions = action[:7]
-            #     gripper_action = action[7]
-            #     try:
-            #         # Move to joint position
-            #         print(f"Moving robot to joint positions: {joint_actions.tolist()}")
-            #         self.robot.move(JointMotion(joint_actions.tolist(), relative_dynamics_factor=0.01))
-                    
-            #         # Control gripper (if available)
-            #         # if hasattr(self.robot, 'gripper'):
-            #         #     self.robot.gripper.move(gripper_action)
-                    
-            #         print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
-                
-
-
+                print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
                 
             except Exception as e:
                 print(f"Failed to send joint commands: {e}")
                 
         except Exception as e:
             print(f"Failed to process actions: {e}")
+            import traceback
+            traceback.print_exc()
             
     def save_point_cloud(self, point_cloud, filename=None):
         """Save point cloud to file for debugging/visualization"""
@@ -543,19 +545,31 @@ class FrankaDiffusionClient:
                 print("Failed to create observation, skipping inference step")
                 return
                 
+            # Validate observation shapes
+            if obs['point_cloud'].shape[0] != 1024:
+                print(f"Warning: Point cloud has {obs['point_cloud'].shape[0]} points, expected 1024")
+            if obs['agent_pos'].shape[0] != 8:
+                print(f"Warning: Agent pos has {obs['agent_pos'].shape[0]} dimensions, expected 8")
+                
             # Update observation history
             self.update_observation_history(obs)
             
             # Create model input
             obs_dict = self.create_model_input()
             if obs_dict is None:
+                print("Failed to create model input")
                 return
+                
+            # Validate model input shapes
+            print(f"Model input shapes - point_cloud: {obs_dict['point_cloud'].shape}, agent_pos: {obs_dict['agent_pos'].shape}")
                 
             # Send to server for inference
             actions = self.send_to_server(obs_dict)
             if actions is None:
+                print("No actions received from server")
                 return
             print(f"Received actions: {actions.shape}")
+            
             # Send actions to robot
             self.send_actions(actions)
             
@@ -564,6 +578,8 @@ class FrankaDiffusionClient:
             
         except Exception as e:
             print(f"Error in inference step: {e}")
+            import traceback
+            traceback.print_exc()
             
     def run(self):
         """Run the inference loop"""
