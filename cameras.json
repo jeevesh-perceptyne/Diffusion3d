@@ -1,6 +1,6 @@
 {
     "right_camera": {
-        "serial_number": "1234567890",
+        "serial_number": "025522060843",
         "model": "D415",
         "intrinsics": {
             "fx": 599.646,
@@ -20,7 +20,7 @@
         }
     },
     "left_camera": {
-        "serial_number": "164576563216",
+        "serial_number": "142422250807",
         "model": "D455",
         "intrinsics": {
             "fx": 390.48,
@@ -38,7 +38,7 @@
         }
     },
     "wrist_camera": {
-        "serial_number": "254625787",
+        "serial_number": "218622278163",
         "model": "D405",
         "intrinsics": {
             "fx": 388.288,

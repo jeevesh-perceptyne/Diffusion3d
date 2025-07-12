@@ -41,8 +41,8 @@ class FrankaDiffusionClient:
         if workspace_bounds is None:
             self.workspace_bounds = [
                 [-0.1, 0.8],  # X bounds (meters)
-                [-0.4, 0.5],  # Y bounds (meters)  
-                [-0.2, 0.8]   # Z bounds (meters)
+                [-0.35, 0.3],  # Y bounds (meters)  
+                [-0.1, 0.8]   # Z bounds (meters)
             ]
         else:
             self.workspace_bounds = workspace_bounds
@@ -157,8 +157,8 @@ class FrankaDiffusionClient:
                 width=640, 
                 height=480,
                 use_depth=True,
-                mock=False,
-                rotation=90
+                mock=False
+                # rotation=90
             ),
         }
         
@@ -234,7 +234,16 @@ class FrankaDiffusionClient:
                         # Convert to 3D point using RealSense deproject
                         point = rs.rs2_deproject_pixel_to_point(rs_intrinsics, [x, y], depth_value / 1000.0)
                         points.append(point)
-            
+            # add clor using color image
+            if color_img is not None and len(points) > 0:
+                color_points = []
+                for i, point in enumerate(points):
+                    if i < color_img.shape[0] * color_img.shape[1]:
+                        color = color_img[i // width, i % width]
+                        color_points.append([point[0], point[1], point[2], color[0], color[1], color[2]])
+                points = color_points
+            else:
+                print(f"No color image available for {camera_name}, using depth points only")
             if len(points) == 0:
                 return None
                 
@@ -251,9 +260,9 @@ class FrankaDiffusionClient:
             # Transform to world frame using extrinsics
             if camera_name in self.extrinsics:
                 transform = self.extrinsics[camera_name]
-                # Add homogeneous coordinate
-                v_homogeneous = np.hstack([v, np.ones((v.shape[0], 1))])
-                # Transform points
+                # Only use xyz for transformation
+                v_xyz = v[:, :3] if v.shape[1] > 3 else v
+                v_homogeneous = np.hstack([v_xyz, np.ones((v_xyz.shape[0], 1))])
                 v_transformed = (transform @ v_homogeneous.T).T
                 v = v_transformed[:, :3]
             else:
@@ -351,13 +360,24 @@ class FrankaDiffusionClient:
             agent_pos = self.joint_state + self.gripper_state  # [7 + 1 = 8]
             
         # Get images and point clouds
+        
         images, point_clouds = self.get_current_images_and_point_clouds()
         
         # Merge point clouds
         merged_pcd = self.merge_point_clouds(point_clouds)
+        #save point cloud for debugging as pcd
+        import open3d as o3d
+        if merged_pcd is not None:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(merged_pcd)
+            o3d.io.write_point_cloud("merged_point_cloud.ply", pcd)
         
         if merged_pcd is None:
             return None
+        
+        #if color points are available, convert to [N, 3] format by removing color
+        if merged_pcd.shape[1] == 6:  # [x, y, z, r, g, b]
+            merged_pcd = merged_pcd[:, :3]
             
         # Create observation dictionary
         obs = {
@@ -404,7 +424,8 @@ class FrankaDiffusionClient:
         # Convert to numpy arrays (will be converted to tensors on server)
         point_cloud_array = np.stack(point_clouds)  # [T, N, 3]
         agent_pos_array = np.stack(agent_poses)     # [T, 8]
-        
+        #negate y-axis of all point clouds
+        point_cloud_array[:, :, 1] *= -1  # Negate Y-axis for consistency
         # Add batch dimension
         point_cloud_array = np.expand_dims(point_cloud_array, axis=0)  # [1, T, N, 3]
         agent_pos_array = np.expand_dims(agent_pos_array, axis=0)      # [1, T, 8]
@@ -464,14 +485,31 @@ class FrankaDiffusionClient:
             # Send joint commands to robot
             try:
                 # Move to joint position
-                print(f"Moving robot to joint positions: {joint_actions.tolist()}")
+                # print(f"Moving robot to joint positions: {joint_actions.tolist()}")
                 self.robot.move(JointMotion(joint_actions.tolist(), relative_dynamics_factor=0.01))
                 
                 # Control gripper (if available)
                 # if hasattr(self.robot, 'gripper'):
                 #     self.robot.gripper.move(gripper_action)
                 
-                print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
+                # print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
+            # actions = actions[0, 0, :]  # [8] - first batch, first timestep
+            # for action in actions:
+            #     joint_actions = action[:7]
+            #     gripper_action = action[7]
+            #     try:
+            #         # Move to joint position
+            #         print(f"Moving robot to joint positions: {joint_actions.tolist()}")
+            #         self.robot.move(JointMotion(joint_actions.tolist(), relative_dynamics_factor=0.01))
+                    
+            #         # Control gripper (if available)
+            #         # if hasattr(self.robot, 'gripper'):
+            #         #     self.robot.gripper.move(gripper_action)
+                    
+            #         print(f"Sent actions - Joints: {joint_actions}, Gripper: {gripper_action}")
+                
+
+
                 
             except Exception as e:
                 print(f"Failed to send joint commands: {e}")
@@ -496,11 +534,13 @@ class FrankaDiffusionClient:
         try:
             # Read current robot state
             if not self.get_robot_state():
+                print("Failed to get robot state, skipping inference step")
                 return
                 
             # Create observation from current sensor data
             obs = self.create_observation()
             if obs is None:
+                print("Failed to create observation, skipping inference step")
                 return
                 
             # Update observation history
@@ -515,7 +555,7 @@ class FrankaDiffusionClient:
             actions = self.send_to_server(obs_dict)
             if actions is None:
                 return
-                
+            print(f"Received actions: {actions.shape}")
             # Send actions to robot
             self.send_actions(actions)
             
@@ -581,7 +621,7 @@ def main():
                         help="IP address of the Franka robot")
     parser.add_argument("--workspace_bounds", nargs=6, type=float, default=None,
                         help="Workspace bounds as x_min x_max y_min y_max z_min z_max")
-    parser.add_argument("--max_history_length", type=int, default=10,
+    parser.add_argument("--max_history_length", type=int, default=2,
                         help="Maximum length of observation history")
     
     args = parser.parse_args()
