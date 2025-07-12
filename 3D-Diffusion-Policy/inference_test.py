@@ -1,3 +1,46 @@
+class ObservationHistoryManager:
+    def __init__(self, max_history_length=2):
+        self.max_history_length = max_history_length
+        self.observation_history = []
+
+    def update_observation_history(self, obs):
+        """Update observation history with new observation"""
+        self.observation_history.append(obs)
+        # Keep only the required number of observations
+        if len(self.observation_history) > self.max_history_length:
+            self.observation_history = self.observation_history[-self.max_history_length:]
+
+    def create_model_input(self):
+        """Create model input from observation history"""
+        if len(self.observation_history) == 0:
+            return None
+        required_length = self.max_history_length
+        current_length = len(self.observation_history)
+        if current_length < required_length:
+            # Repeat the first observation to pad
+            padding_needed = required_length - current_length
+            first_obs = self.observation_history[0]
+            padded_history = [first_obs] * padding_needed + self.observation_history
+        else:
+            padded_history = self.observation_history[-required_length:]
+        point_clouds = []
+        agent_poses = []
+        for obs in padded_history:
+            point_clouds.append(obs['point_cloud'])
+            agent_poses.append(obs['agent_pos'])
+        point_cloud_array = np.stack(point_clouds)  # [T, N, 3] or [T, 1, 1024, 3]
+        agent_pos_array = np.stack(agent_poses)     # [T, 1, 1, 8] or [T, 1, 8]
+        # Remove extra singleton dimensions if present
+        point_cloud_array = np.squeeze(point_cloud_array)
+        agent_pos_array = np.squeeze(agent_pos_array)
+        # Add batch dimension
+        point_cloud_array = np.expand_dims(point_cloud_array, axis=0)  # [1, T, ...]
+        agent_pos_array = np.expand_dims(agent_pos_array, axis=0)      # [1, T, ...]
+        obs_dict = {
+            'point_cloud': point_cloud_array,
+            'agent_pos': agent_pos_array
+        }
+        return obs_dict
 #!/usr/bin/env python3
 
 import socket
@@ -189,7 +232,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Initialize the server
+    # # Initialize the server
     server_instance = DiffusionPolicyServer(
         config_path=args.config_path,
         s3_bucket=args.s3_bucket,
@@ -201,22 +244,92 @@ def main():
     )
     
     # Start the socket server
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((args.host, args.port))
-    server.listen(5)
-    print(f"Server listening on {args.host}:{args.port}")
+    # server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # server.bind((args.host, args.port))
+    # server.listen(5)
+    # print(f"Server listening on {args.host}:{args.port}")
     
-    try:
-        while True:
-            conn, addr = server.accept()
-            print(f"Connection from {addr}")
-            threading.Thread(target=handle_client, args=(conn, server_instance)).start()
-    except KeyboardInterrupt:
-        print("Shutting down server...")
-    finally:
-        server.close()
+    # try:
+    #     while True:
+    #         conn, addr = server.accept()
+    #         print(f"Connection from {addr}")
+    #         threading.Thread(target=handle_client, args=(conn, server_instance)).start()
+    # except KeyboardInterrupt:
+    #     print("Shutting down server...")
+    # finally:
+    #     server.close()
 
+    episode_path = "/home/jeeveshm/franka_teleop/test_recordings/episode_001/"
+    point_cloud_folder = os.path.join(episode_path, "merged_1024/")
+    episode_data = os.path.join(episode_path, "episode_data.npz")
+    point_cloud_files = sorted(os.listdir(point_cloud_folder))
+    num_frames = len(point_cloud_files)
+    print(f"Number of frames in episode: {num_frames}")
+    point_clouds = []
+    for i in range(num_frames):
+        point_cloud_path = os.path.join(point_cloud_folder, point_cloud_files[i])
+        import open3d as o3d
+        point_cloud = o3d.io.read_point_cloud(point_cloud_path)
+        point_cloud = np.asarray(point_cloud.points)
+        #pcd shape is (1024, 3) make it (1,1,1024,3)
+        point_cloud = point_cloud[np.newaxis, np.newaxis, :, :]  # Reshape to (1, 1, 1024, 3)
+        point_clouds.append(point_cloud)
+    print(f"Point clouds shape: {len(point_clouds)} frames, each with shape {point_clouds[0].shape}")
+    joints = np.load(episode_data)['joint_states']
+    gripper = np.load(episode_data)['gripper_states']
+    agent_poses = np.concatenate((joints, gripper), axis=-1)  # Concatenate along the last dimension
+    agent_poses = agent_poses[np.newaxis, np.newaxis, :, :]
+    #reshape from (1,1,num_frames,8) to (num_frames, 1, 1, 8)
+    agent_poses = agent_poses.reshape(num_frames, 1, 1, -1)  # Reshape to (num_frames, 1, 1, 8)
+    #make agent_poses also a list of num_frames with each having shape (1, 1, 8)
+    agent_poses = [agent_poses[i] for i in range(num_frames)]
+    print(f"Agent poses shape: {len(agent_poses)} frames, each with shape {agent_poses[0].shape}")
+    #Similar;y get actions from same numpy file
+    gello_jnts = np.load(episode_data)['gello_joint_states']
+    gello_gripper = np.load(episode_data)['gello_gripper_percent'].reshape(-1, 1)  # Ensure gripper is reshaped to (num_frames, 1
+    actions_gt = np.concatenate((gello_jnts, gello_gripper), axis=-1)  # Concatenate along the last dimension
+    actions_gt = actions_gt[np.newaxis, np.newaxis, :, :]  # Reshape to (1, 1, num_frames, 8)
+    actions_gt = actions_gt.reshape(num_frames, 1, 1, -1)  # Reshape to (num_frames, 1, 1, 8)
+    actions_gt = [actions_gt[i] for i in range(num_frames)]
+    # Use observation history manager for stacking
+    max_history_length = 2  # Set as needed for your model
+    import socket
+    obs_hist_mgr = ObservationHistoryManager(max_history_length=max_history_length)
+    host = '127.0.0.1'  # Use localhost for client connection
+    port = 5000
+    import time
+    all_actions = []
+    for i in range(num_frames):
+        obs = {
+            'point_cloud': point_clouds[i],
+            'agent_pos': agent_poses[i]
+        }
+        obs_hist_mgr.update_observation_history(obs)
+        model_input = obs_hist_mgr.create_model_input()
+        if model_input is None:
+            print(f"Skipping frame {i+1}: not enough history.")
+            all_actions.append(np.zeros((1, 8), dtype=np.float32))
+            continue
+        actions = server_instance.run_inference(model_input)
+        if actions is not None:
+            print(f"Actions for frame {i+1}: {actions[0,0,:]}")
+            gt_action = actions_gt[i]
+            print(f"Ground truth action for frame {i+1}: {gt_action}")
+            all_actions.append(actions[0,0,:].reshape(1, 8))
+        else:
+            print(f"Inference failed for frame {i+1}")
+            all_actions.append(np.zeros((1, 8), dtype=np.float32))
+        time.sleep(0.01)
+
+    # Stack all actions into [num_frames, 8]
+    all_actions_array = np.concatenate(all_actions, axis=0)  # shape: [num_frames, 8]
+    print(f"All actions shape: {all_actions_array.shape}")  
+    # save actions to a file
+    output_file = os.path.join(episode_path, "inferred_actions_infer.npy")
+    np.save(output_file, all_actions_array)
+    print(f"All actions saved to {output_file}")    
+   
 if __name__ == "__main__":
     main()
 
