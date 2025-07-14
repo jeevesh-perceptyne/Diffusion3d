@@ -81,28 +81,8 @@ class DiffusionPolicyServer:
                 self.workspace.ema_model.load_state_dict(ckpt['ema_state_dict'])
             
             # Load normalizer state (essential for proper inference)
-            normalizer_loaded = False
             if hasattr(self.workspace.model, 'normalizer') and 'normalizer_state_dict' in ckpt:
                 self.workspace.model.normalizer.load_state_dict(ckpt['normalizer_state_dict'])
-                normalizer_loaded = True
-                print("Loaded normalizer from checkpoint")
-            elif hasattr(self.workspace, 'normalizer') and 'normalizer_state_dict' in ckpt:
-                self.workspace.normalizer.load_state_dict(ckpt['normalizer_state_dict'])
-                normalizer_loaded = True
-                print("Loaded normalizer from workspace")
-            else:
-                print("Warning: No normalizer found in checkpoint - inference may be incorrect!")
-            
-            # Store normalizer for easy access
-            if normalizer_loaded:
-                if hasattr(self.workspace.model, 'normalizer'):
-                    self.normalizer = self.workspace.model.normalizer
-                elif hasattr(self.workspace, 'normalizer'):
-                    self.normalizer = self.workspace.normalizer
-                else:
-                    self.normalizer = None
-            else:
-                self.normalizer = None
             
             # Move models to device
             self.workspace.model.to(self.device)
@@ -123,11 +103,6 @@ class DiffusionPolicyServer:
     def run_inference(self, obs_dict):
         """Run inference with the diffusion policy model - MATCH TRAINING EXACTLY"""
         try:
-            # Debug: Print detailed input information
-            print(f"DEBUG SERVER - Input received:")
-            print(f"  Point cloud shape: {obs_dict['point_cloud'].shape}")
-            print(f"  Agent pos shape: {obs_dict['agent_pos'].shape}")
-            print(f"  Agent pos values: {obs_dict['agent_pos']}")
             if isinstance(obs_dict['point_cloud'], np.ndarray):
                 print(f"  Point cloud stats - mean: {np.mean(obs_dict['point_cloud']):.4f}, std: {np.std(obs_dict['point_cloud']):.4f}")
             
@@ -137,12 +112,6 @@ class DiffusionPolicyServer:
             if isinstance(obs_dict['agent_pos'], np.ndarray):
                 obs_dict['agent_pos'] = torch.from_numpy(obs_dict['agent_pos']).float().to(self.device)
             
-            print(f"DEBUG SERVER - Converted to tensors:")
-            print(f"  Point cloud tensor shape: {obs_dict['point_cloud'].shape}")
-            print(f"  Agent pos tensor shape: {obs_dict['agent_pos'].shape}")
-            print(f"  Agent pos tensor values: {obs_dict['agent_pos']}")
-            print(f"  Point cloud tensor device: {obs_dict['point_cloud'].device}")
-            print(f"  Agent pos tensor device: {obs_dict['agent_pos'].device}")
             
             # Select the appropriate model
             if self.use_ema and self.workspace.ema_model is not None:
@@ -156,12 +125,6 @@ class DiffusionPolicyServer:
             with torch.no_grad():
                 result = policy.predict_action(obs_dict)
                 pred_action = result['action_pred'] 
-                
-            print(f"DEBUG SERVER - Model output:")
-            print(f"  Action prediction shape: {pred_action.shape}")
-            print(f"  First action: {pred_action[0, 0, :].cpu().numpy()}")
-            print(f"  Action stats - mean: {torch.mean(pred_action).item():.4f}, std: {torch.std(pred_action).item():.4f}")
-            
             return pred_action.cpu().numpy()
             
         except Exception as e:

@@ -311,6 +311,10 @@ def main():
             print(f"Skipping frame {i+1}: not enough history.")
             all_actions.append(np.zeros((1, 8), dtype=np.float32))
             continue
+        #print model input 
+        print(f"Model input for frame {i+1}: point_cloud shape {model_input['point_cloud'].shape}, agent_pos shape {model_input['agent_pos'].shape}")
+        #print agent_pos
+        print(f"Agent position for frame {i+1}: {model_input['agent_pos']}")
         actions = server_instance.run_inference(model_input)
         if actions is not None:
             print(f"Actions for frame {i+1}: {actions[0,0,:]}")
