@@ -135,26 +135,21 @@ class DiffusionPolicyServer:
             print(f"Converted to tensors - point_cloud: {obs_dict['point_cloud'].shape}, agent_pos: {obs_dict['agent_pos'].shape}")
             
             # Apply normalization exactly like during training
-            obs_dict_normalized = dict()
-            if hasattr(self.workspace.model, 'normalizer') and self.workspace.model.normalizer is not None:
-                print("Applying normalizer from model")
-                # Normalize using the model's normalizer (loaded from checkpoint)
-                normalizer = self.workspace.model.normalizer
-                obs_dict_normalized['agent_pos'] = normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
-                obs_dict_normalized['point_cloud'] = normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
-            elif hasattr(self, 'normalizer') and self.normalizer is not None:
-                print("Applying normalizer from server")
-                # Use server normalizer if available
-                obs_dict_normalized['agent_pos'] = self.normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
-                obs_dict_normalized['point_cloud'] = self.normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
-            else:
-                print("WARNING: No normalizer found, using raw observations")
-                obs_dict_normalized = obs_dict
-            
-            # Create the obs dict in the format expected by the model
-            formatted_obs = {
-                'obs': obs_dict_normalized
-            }
+            # obs_dict_normalized = dict()
+            # if hasattr(self.workspace.model, 'normalizer') and self.workspace.model.normalizer is not None:
+            #     print("Applying normalizer from model")
+            #     # Normalize using the model's normalizer (loaded from checkpoint)
+            #     normalizer = self.workspace.model.normalizer
+            #     obs_dict_normalized['agent_pos'] = normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
+            #     obs_dict_normalized['point_cloud'] = normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
+            # elif hasattr(self, 'normalizer') and self.normalizer is not None:
+            #     print("Applying normalizer from server")
+            #     # Use server normalizer if available
+            #     obs_dict_normalized['agent_pos'] = self.normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
+            #     obs_dict_normalized['point_cloud'] = self.normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
+            # else:
+            #     print("WARNING: No normalizer found, using raw observations")
+            #     obs_dict_normalized = obs_dict
             
             # Select the appropriate model
             if self.use_ema and self.workspace.ema_model is not None:
@@ -164,10 +159,10 @@ class DiffusionPolicyServer:
                 policy = self.workspace.model
                 print("Using main model for inference")
                 
-            # Run inference
+            # Run inference - pass obs_dict directly like in offline inference
             with torch.no_grad():
-                result = policy.predict_action(formatted_obs)
-                pred_action = result['action_pred']  # [batch, horizon, action_dim]
+                result = policy.predict_action(obs_dict)
+                pred_action = result['action_pred'] 
                 
             print(f"Action prediction shape: {pred_action.shape}")
             return pred_action.cpu().numpy()

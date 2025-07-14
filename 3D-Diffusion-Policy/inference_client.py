@@ -29,7 +29,7 @@ class FrankaDiffusionClient:
                  server_port: int = 5000,
                  robot_ip: str = "172.16.0.2",
                  workspace_bounds: list = None,
-                 max_history_length: int = 10):
+                 max_history_length: int = 2):
         
         self.cameras_config_path = cameras_config_path
         self.server_ip = server_ip
@@ -39,11 +39,11 @@ class FrankaDiffusionClient:
         
         # Workspace bounds for point cloud cropping - MATCH TRAINING DATA EXACTLY
         if workspace_bounds is None:
-            # Use exact same bounds as training data conversion script
+            # Use exact same bounds as training config (dp3.yaml -> task/franka_custom.yaml)
             self.workspace_bounds = [
-                [0.3, 1.0],   # x: forward/backward from robot base
-                [-0.5, 0.5],  # y: left/right from robot base  
-                [-0.1, 0.8]   # z: up/down from robot base
+                [-0.1, 0.8],   # x: forward/backward from robot base
+                [-0.4, 0.5],   # y: left/right from robot base  
+                [-0.2, 0.8]    # z: up/down from robot base
             ]
         else:
             self.workspace_bounds = workspace_bounds
@@ -145,7 +145,7 @@ class FrankaDiffusionClient:
         """Setup Intel RealSense cameras - MATCH RECORDING SCRIPT EXACTLY"""
         self.camera_configs = {
             "left_camera": IntelRealSenseCameraConfig(
-                serial_number="142422250807",  # Match recording script
+                serial_number="142422250807",
                 fps=30, 
                 width=640, 
                 height=480,
@@ -153,7 +153,7 @@ class FrankaDiffusionClient:
                 mock=False
             ),
             "right_camera": IntelRealSenseCameraConfig(
-                serial_number="025522060843",  # Match recording script
+                serial_number="025522060843",
                 fps=30, 
                 width=640, 
                 height=480,
