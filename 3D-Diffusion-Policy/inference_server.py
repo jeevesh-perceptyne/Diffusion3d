@@ -123,8 +123,13 @@ class DiffusionPolicyServer:
     def run_inference(self, obs_dict):
         """Run inference with the diffusion policy model - MATCH TRAINING EXACTLY"""
         try:
-            # Debug: Print input shapes
-            print(f"Input shapes - point_cloud: {obs_dict['point_cloud'].shape}, agent_pos: {obs_dict['agent_pos'].shape}")
+            # Debug: Print detailed input information
+            print(f"DEBUG SERVER - Input received:")
+            print(f"  Point cloud shape: {obs_dict['point_cloud'].shape}")
+            print(f"  Agent pos shape: {obs_dict['agent_pos'].shape}")
+            print(f"  Agent pos values: {obs_dict['agent_pos']}")
+            if isinstance(obs_dict['point_cloud'], np.ndarray):
+                print(f"  Point cloud stats - mean: {np.mean(obs_dict['point_cloud']):.4f}, std: {np.std(obs_dict['point_cloud']):.4f}")
             
             # Convert numpy arrays to torch tensors if needed
             if isinstance(obs_dict['point_cloud'], np.ndarray):
@@ -132,24 +137,12 @@ class DiffusionPolicyServer:
             if isinstance(obs_dict['agent_pos'], np.ndarray):
                 obs_dict['agent_pos'] = torch.from_numpy(obs_dict['agent_pos']).float().to(self.device)
             
-            print(f"Converted to tensors - point_cloud: {obs_dict['point_cloud'].shape}, agent_pos: {obs_dict['agent_pos'].shape}")
-            
-            # Apply normalization exactly like during training
-            # obs_dict_normalized = dict()
-            # if hasattr(self.workspace.model, 'normalizer') and self.workspace.model.normalizer is not None:
-            #     print("Applying normalizer from model")
-            #     # Normalize using the model's normalizer (loaded from checkpoint)
-            #     normalizer = self.workspace.model.normalizer
-            #     obs_dict_normalized['agent_pos'] = normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
-            #     obs_dict_normalized['point_cloud'] = normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
-            # elif hasattr(self, 'normalizer') and self.normalizer is not None:
-            #     print("Applying normalizer from server")
-            #     # Use server normalizer if available
-            #     obs_dict_normalized['agent_pos'] = self.normalizer['agent_pos'].normalize(obs_dict['agent_pos'])
-            #     obs_dict_normalized['point_cloud'] = self.normalizer['point_cloud'].normalize(obs_dict['point_cloud'])
-            # else:
-            #     print("WARNING: No normalizer found, using raw observations")
-            #     obs_dict_normalized = obs_dict
+            print(f"DEBUG SERVER - Converted to tensors:")
+            print(f"  Point cloud tensor shape: {obs_dict['point_cloud'].shape}")
+            print(f"  Agent pos tensor shape: {obs_dict['agent_pos'].shape}")
+            print(f"  Agent pos tensor values: {obs_dict['agent_pos']}")
+            print(f"  Point cloud tensor device: {obs_dict['point_cloud'].device}")
+            print(f"  Agent pos tensor device: {obs_dict['agent_pos'].device}")
             
             # Select the appropriate model
             if self.use_ema and self.workspace.ema_model is not None:
@@ -164,7 +157,11 @@ class DiffusionPolicyServer:
                 result = policy.predict_action(obs_dict)
                 pred_action = result['action_pred'] 
                 
-            print(f"Action prediction shape: {pred_action.shape}")
+            print(f"DEBUG SERVER - Model output:")
+            print(f"  Action prediction shape: {pred_action.shape}")
+            print(f"  First action: {pred_action[0, 0, :].cpu().numpy()}")
+            print(f"  Action stats - mean: {torch.mean(pred_action).item():.4f}, std: {torch.std(pred_action).item():.4f}")
+            
             return pred_action.cpu().numpy()
             
         except Exception as e:

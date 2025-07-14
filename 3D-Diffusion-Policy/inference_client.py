@@ -83,7 +83,7 @@ class FrankaDiffusionClient:
             
             # Get gripper position (assuming you have gripper setup)
             # gripper_width = self.robot.gripper.width()  # Uncomment if gripper available
-            gripper_width = 0.00  # Default gripper width for now
+            gripper_width = 0.04  # Default gripper width for now
             
             with self.lock:
                 self.joint_state = joint_positions.tolist()
@@ -364,6 +364,12 @@ class FrankaDiffusionClient:
             # Get current agent position (joint + gripper states)
             agent_pos = self.joint_state + self.gripper_state  # [7 + 1 = 8]
             
+        # Debug: Print agent state details
+        print(f"DEBUG - Current agent state:")
+        print(f"  Joint positions: {self.joint_state}")
+        print(f"  Gripper state: {self.gripper_state}")
+        print(f"  Combined agent_pos: {agent_pos}")
+            
         # Get images and point clouds
         
         images, point_clouds = self.get_current_images_and_point_clouds()
@@ -434,6 +440,12 @@ class FrankaDiffusionClient:
         point_cloud_array = np.stack(point_clouds)  # [T, N, 3]
         agent_pos_array = np.stack(agent_poses)     # [T, D]
         
+        # Debug: Print model input details before batching
+        print(f"DEBUG - Model input before batching:")
+        print(f"  Point cloud array shape: {point_cloud_array.shape}")
+        print(f"  Agent pos array shape: {agent_pos_array.shape}")
+        print(f"  Agent pos values: {agent_pos_array}")
+        
         # Ensure point clouds are exactly the right shape [T, 1024, 3]
         if point_cloud_array.shape[1] != 1024:
             print(f"Warning: point cloud has {point_cloud_array.shape[1]} points, expected 1024")
@@ -441,6 +453,12 @@ class FrankaDiffusionClient:
         # Add batch dimension to match training format
         point_cloud_array = np.expand_dims(point_cloud_array, axis=0)  # [1, T, N, 3]
         agent_pos_array = np.expand_dims(agent_pos_array, axis=0)      # [1, T, D]
+        
+        # Debug: Print final model input
+        print(f"DEBUG - Final model input:")
+        print(f"  Point cloud batch shape: {point_cloud_array.shape}")
+        print(f"  Agent pos batch shape: {agent_pos_array.shape}")
+        print(f"  Agent pos batch values: {agent_pos_array}")
         
         obs_dict = {
             'point_cloud': point_cloud_array,
@@ -452,6 +470,13 @@ class FrankaDiffusionClient:
     def send_to_server(self, obs_dict):
         """Send observation to server and receive actions"""
         try:
+            # Debug: Print what we're sending
+            print(f"DEBUG - Sending to server:")
+            print(f"  Point cloud shape: {obs_dict['point_cloud'].shape}")
+            print(f"  Agent pos shape: {obs_dict['agent_pos'].shape}")
+            print(f"  Agent pos values: {obs_dict['agent_pos']}")
+            print(f"  Point cloud stats - mean: {np.mean(obs_dict['point_cloud']):.4f}, std: {np.std(obs_dict['point_cloud']):.4f}")
+            
             # Serialize observation
             data = pickle.dumps(obs_dict) + b"<END>"
             
@@ -474,6 +499,13 @@ class FrankaDiffusionClient:
             
             actions = pickle.loads(response)
             s.close()
+            
+            # Debug: Print what we received
+            if actions is not None:
+                print(f"DEBUG - Received from server:")
+                print(f"  Actions shape: {actions.shape}")
+                print(f"  First action: {actions[0, 0, :]}")
+                print(f"  Action stats - mean: {np.mean(actions):.4f}, std: {np.std(actions):.4f}")
             
             return actions
             
