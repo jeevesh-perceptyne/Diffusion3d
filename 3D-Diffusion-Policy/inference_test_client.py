@@ -55,7 +55,7 @@ robot = Robot(ip)
 gripper = Gripper(ip)
 joint_waypoints = []
 for i in range(smoothed_actions.shape[0]):
-    if(i% 10 == 0) and i>200:
+    if(i% 10 == 0):
         print(f"Executing action {i+1}/{smoothed_actions.shape[0]}")
         action = smoothed_actions[i][:7]
         robot.move(JointMotion(action.tolist(),relative_dynamics_factor=0.01))

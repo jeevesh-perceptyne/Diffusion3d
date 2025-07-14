@@ -42,8 +42,8 @@ class FrankaDiffusionClient:
             # Use exact same bounds as training config (dp3.yaml -> task/franka_custom.yaml)
             self.workspace_bounds = [
                 [-0.1, 0.8],   # x: forward/backward from robot base
-                [-0.4, 0.5],   # y: left/right from robot base  
-                [-0.2, 0.8]    # z: up/down from robot base
+                [-0.35, 0.3],   # y: left/right from robot base  
+                [-0.1, 0.8]    # z: up/down from robot base
             ]
         else:
             self.workspace_bounds = workspace_bounds
@@ -364,11 +364,6 @@ class FrankaDiffusionClient:
             # Get current agent position (joint + gripper states)
             agent_pos = self.joint_state + self.gripper_state  # [7 + 1 = 8]
             
-        # Debug: Print agent state details
-        print(f"DEBUG - Current agent state:")
-        print(f"  Joint positions: {self.joint_state}")
-        print(f"  Gripper state: {self.gripper_state}")
-        print(f"  Combined agent_pos: {agent_pos}")
             
         # Get images and point clouds
         
@@ -378,14 +373,15 @@ class FrankaDiffusionClient:
         merged_pcd = self.merge_point_clouds(point_clouds)
         
         # Debug: save point cloud for debugging (commented out for performance)
-        # if merged_pcd is not None:
-        #     try:
-        #         import open3d as o3d
-        #         pcd = o3d.geometry.PointCloud()
-        #         pcd.points = o3d.utility.Vector3dVector(merged_pcd)
-        #         o3d.io.write_point_cloud("merged_point_cloud.ply", pcd)
-        #     except ImportError:
-        #         pass
+        if merged_pcd is not None:
+            try:
+                import open3d as o3d
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(merged_pcd)
+                o3d.io.write_point_cloud("merged_point_cloud.pcd", pcd)
+                print("Saved merged point cloud to 'merged_point_cloud.pcd'")
+            except ImportError:
+                pass
         
         if merged_pcd is None:
             return None
@@ -440,11 +436,6 @@ class FrankaDiffusionClient:
         point_cloud_array = np.stack(point_clouds)  # [T, N, 3]
         agent_pos_array = np.stack(agent_poses)     # [T, D]
         
-        # Debug: Print model input details before batching
-        print(f"DEBUG - Model input before batching:")
-        print(f"  Point cloud array shape: {point_cloud_array.shape}")
-        print(f"  Agent pos array shape: {agent_pos_array.shape}")
-        print(f"  Agent pos values: {agent_pos_array}")
         
         # Ensure point clouds are exactly the right shape [T, 1024, 3]
         if point_cloud_array.shape[1] != 1024:
@@ -454,12 +445,10 @@ class FrankaDiffusionClient:
         point_cloud_array = np.expand_dims(point_cloud_array, axis=0)  # [1, T, N, 3]
         agent_pos_array = np.expand_dims(agent_pos_array, axis=0)      # [1, T, D]
         
-        # Debug: Print final model input
-        print(f"DEBUG - Final model input:")
-        print(f"  Point cloud batch shape: {point_cloud_array.shape}")
-        print(f"  Agent pos batch shape: {agent_pos_array.shape}")
-        print(f"  Agent pos batch values: {agent_pos_array}")
-        
+        #print agent_pos_array
+        print(f"Observation shapes - point_cloud: {point_cloud_array.shape}, agent_pos: {agent_pos_array.shape}")
+        #print agent_pos_array
+        print(f"Observation data - agent_pos: {agent_pos_array}")
         obs_dict = {
             'point_cloud': point_cloud_array,
             'agent_pos': agent_pos_array
@@ -470,13 +459,6 @@ class FrankaDiffusionClient:
     def send_to_server(self, obs_dict):
         """Send observation to server and receive actions"""
         try:
-            # Debug: Print what we're sending
-            print(f"DEBUG - Sending to server:")
-            print(f"  Point cloud shape: {obs_dict['point_cloud'].shape}")
-            print(f"  Agent pos shape: {obs_dict['agent_pos'].shape}")
-            print(f"  Agent pos values: {obs_dict['agent_pos']}")
-            print(f"  Point cloud stats - mean: {np.mean(obs_dict['point_cloud']):.4f}, std: {np.std(obs_dict['point_cloud']):.4f}")
-            
             # Serialize observation
             data = pickle.dumps(obs_dict) + b"<END>"
             
@@ -500,12 +482,6 @@ class FrankaDiffusionClient:
             actions = pickle.loads(response)
             s.close()
             
-            # Debug: Print what we received
-            if actions is not None:
-                print(f"DEBUG - Received from server:")
-                print(f"  Actions shape: {actions.shape}")
-                print(f"  First action: {actions[0, 0, :]}")
-                print(f"  Action stats - mean: {np.mean(actions):.4f}, std: {np.std(actions):.4f}")
             
             return actions
             
@@ -535,7 +511,7 @@ class FrankaDiffusionClient:
             try:
                 # Move to joint position with appropriate dynamics
                 print(f"Moving robot to joint positions: {joint_actions.tolist()}")
-                self.robot.move(JointMotion(joint_actions.tolist(), relative_dynamics_factor=0.01))
+                self.robot.move(JointMotion(joint_actions.tolist(), relative_dynamics_factor=0.05))
                 
                 # Control gripper (if available)
                 # if hasattr(self.robot, 'gripper'):
