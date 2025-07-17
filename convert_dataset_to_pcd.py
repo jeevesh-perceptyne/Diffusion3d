@@ -162,7 +162,25 @@ class DatasetConverter:
         self.extrinsics = {}
         self.camera_intrinsics = {}
         
-        for camera_name, camera_config in camera_data.items():
+        # Optimize camera loading - only load the specific camera if specified
+        cameras_to_load = []
+        if self.camera_to_process:
+            target_camera = f"{self.camera_to_process}_camera"
+            if target_camera in camera_data:
+                cameras_to_load = [target_camera]
+                logger.info(f"Loading configuration for {self.camera_to_process} camera only")
+            else:
+                logger.error(f"Camera {target_camera} not found in configuration file")
+                available_cameras = list(camera_data.keys())
+                logger.error(f"Available cameras: {available_cameras}")
+                raise ValueError(f"Camera {target_camera} not found in configuration")
+        else:
+            cameras_to_load = list(camera_data.keys())
+            logger.info("Loading configuration for all cameras")
+        
+        for camera_name in cameras_to_load:
+            camera_config = camera_data[camera_name]
+            
             # Extract transformation matrix (extrinsics)
             transform_matrix = np.array(camera_config['extrinsics']['SE3'])
             self.extrinsics[camera_name] = transform_matrix
@@ -642,16 +660,23 @@ class DatasetConverter:
         try:
             logger.debug(f"    Processing {camera_name} (folder: {folder_prefix})")
             
-            # Try both video files and individual frames
+            # Optimized file path detection
             video_path = episode_dir / f"{folder_prefix}_camera.mp4"
             rgb_path = episode_dir / f"{folder_prefix}_images" / f"frame_{frame_idx:06d}.png"
             depth_path = episode_dir / f"{folder_prefix}_depth_images" / f"frame_{frame_idx:06d}.png"
             
-            # Load RGB image (from video or individual frames)
+            # Check if depth file exists first (required for all cameras)
+            if not depth_path.exists():
+                logger.warning(f"    Missing depth file for {camera_name} frame {frame_idx}: {depth_path}")
+                return camera_name, None
+            
+            # Load RGB image (prioritize video if available for faster access)
             rgb_image = None
             if video_path.exists():
                 rgb_image = self.extract_frame_from_video(video_path, frame_idx)
-            elif rgb_path.exists():
+            
+            # Fallback to individual frames if video failed or doesn't exist
+            if rgb_image is None and rgb_path.exists():
                 rgb_image = cv2.imread(str(rgb_path))
                 if rgb_image is not None:
                     rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
@@ -660,11 +685,7 @@ class DatasetConverter:
                 logger.warning(f"    Could not load RGB image for {camera_name} frame {frame_idx}")
                 return camera_name, None
             
-            # Load depth image (only from individual frames)
-            if not depth_path.exists():
-                logger.warning(f"    Missing depth file for {camera_name} frame {frame_idx}")
-                return camera_name, None
-            
+            # Load depth image
             depth_image = cv2.imread(str(depth_path), cv2.IMREAD_ANYDEPTH)
             if depth_image is None:
                 logger.warning(f"    Could not load depth image for {camera_name} frame {frame_idx}")
@@ -711,68 +732,70 @@ class DatasetConverter:
             'right_camera': 'right'
         }
         
-        # Filter camera mappings based on camera_to_process
+        # Optimized processing for single camera
         if self.camera_to_process:
             camera_name = f"{self.camera_to_process}_camera"
-            if camera_name in all_camera_mappings:
-                camera_mappings = {camera_name: all_camera_mappings[camera_name]}
-                logger.debug(f"  Processing only {self.camera_to_process} camera")
-            else:
+            if camera_name not in all_camera_mappings:
                 logger.error(f"  Invalid camera_to_process: {self.camera_to_process}")
                 return frame_data
-        else:
-            camera_mappings = all_camera_mappings
-            logger.debug(f"  Processing all cameras")
-        
-        logger.debug(f"  Camera mappings: {camera_mappings}")
-        
-        # Step 1: Process cameras in parallel and collect transformed point clouds
-        camera_point_clouds = {}
-        
-        # Use ThreadPoolExecutor for I/O bound operations (reading images)
-        with ThreadPoolExecutor(max_workers=min(3, len(camera_mappings))) as executor:
-            # Submit all camera processing tasks
-            future_to_camera = {}
-            for camera_name, folder_prefix in camera_mappings.items():
-                future = executor.submit(
-                    self.process_single_camera,
-                    episode_dir, frame_idx, camera_name, folder_prefix, end_effector_pose
-                )
-                future_to_camera[future] = camera_name
             
-            # Collect results as they complete
-            for future in as_completed(future_to_camera):
-                camera_name, points = future.result()
-                if points is not None:
-                    camera_point_clouds[camera_name] = points
-                    logger.debug(f"    {camera_name}: {len(points)} points processed")
-        
-        # Step 2: Process individual cameras if specified
-        if self.camera_to_process:
-            camera_name = f"{self.camera_to_process}_camera"
-            if camera_name in camera_point_clouds:
-                logger.debug(f"  Processing {self.camera_to_process} camera individually...")
-                camera_points = camera_point_clouds[camera_name]
+            folder_prefix = all_camera_mappings[camera_name]
+            logger.debug(f"  Processing only {self.camera_to_process} camera")
+            
+            # Process single camera directly without threading
+            camera_name_result, points = self.process_single_camera(
+                episode_dir, frame_idx, camera_name, folder_prefix, end_effector_pose
+            )
+            
+            if points is not None:
+                logger.debug(f"    {camera_name}: {len(points)} points processed")
                 
                 # Crop to workspace
                 logger.debug(f"    Cropping {self.camera_to_process} camera to workspace...")
-                camera_points = self.crop_workspace(camera_points)
+                points = self.crop_workspace(points)
                 
-                if len(camera_points) > 0:
-                    logger.debug(f"    After cropping: {len(camera_points)} points")
+                if len(points) > 0:
+                    logger.debug(f"    After cropping: {len(points)} points")
                     
                     # Apply FPS (4000 points)
                     logger.debug(f"    Applying FPS to {self.camera_to_process} camera...")
-                    camera_points = self.farthest_point_sampling(camera_points, 4000)
+                    points = self.farthest_point_sampling(points, 4000)
                     
-                    logger.debug(f"    Final {self.camera_to_process} point cloud: {len(camera_points)} points")
+                    logger.debug(f"    Final {self.camera_to_process} point cloud: {len(points)} points")
                     
                     # Save camera PCD file
-                    self.save_frame_pcd(episode_dir, camera_name, frame_idx, camera_points)
-                    frame_data[camera_name] = camera_points
+                    self.save_frame_pcd(episode_dir, camera_name, frame_idx, points)
+                    frame_data[camera_name] = points
                 else:
                     logger.warning(f"    No {self.camera_to_process} points in workspace for frame {frame_idx}")
+            else:
+                logger.warning(f"    Failed to process {self.camera_to_process} camera for frame {frame_idx}")
         else:
+            # Original multi-camera processing logic
+            camera_mappings = all_camera_mappings
+            logger.debug(f"  Processing all cameras")
+            logger.debug(f"  Camera mappings: {camera_mappings}")
+            
+            # Step 1: Process cameras in parallel and collect transformed point clouds
+            camera_point_clouds = {}
+            
+            # Use ThreadPoolExecutor for I/O bound operations (reading images)
+            with ThreadPoolExecutor(max_workers=min(3, len(camera_mappings))) as executor:
+                # Submit all camera processing tasks
+                future_to_camera = {}
+                for camera_name, folder_prefix in camera_mappings.items():
+                    future = executor.submit(
+                        self.process_single_camera,
+                        episode_dir, frame_idx, camera_name, folder_prefix, end_effector_pose
+                    )
+                    future_to_camera[future] = camera_name
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_camera):
+                    camera_name, points = future.result()
+                    if points is not None:
+                        camera_point_clouds[camera_name] = points
+                        logger.debug(f"    {camera_name}: {len(points)} points processed")
             # Step 2: Process wrist camera (individual processing, crop, FPS, save)
             if 'wrist_camera' in camera_point_clouds:
                 logger.debug(f"  Processing wrist camera individually...")
@@ -883,34 +906,66 @@ class DatasetConverter:
             logger.info(f"No NPZ file found, counting frames from image directories or videos...")
             episode_data = None
             
-            # First try to count frames from videos
-            sample_video = episode_dir / "left_camera.mp4"
-            if sample_video.exists():
-                logger.info(f"Found video file, counting frames from: {sample_video}")
-                try:
-                    cap = cv2.VideoCapture(str(sample_video))
-                    if cap.isOpened():
-                        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        fps = cap.get(cv2.CAP_PROP_FPS)
-                        cap.release()
-                        logger.info(f"Video has {num_frames} frames at {fps:.2f} FPS")
-                    else:
-                        logger.error(f"Could not open video file: {sample_video}")
+            # Optimize frame counting based on camera_to_process
+            if self.camera_to_process:
+                # Only check the specific camera we're processing
+                camera_prefix = self.camera_to_process
+                sample_video = episode_dir / f"{camera_prefix}_camera.mp4"
+                sample_dir = episode_dir / f"{camera_prefix}_images"
+                
+                if sample_video.exists():
+                    logger.info(f"Found video file for {self.camera_to_process}, counting frames from: {sample_video}")
+                    try:
+                        cap = cv2.VideoCapture(str(sample_video))
+                        if cap.isOpened():
+                            num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            cap.release()
+                            logger.info(f"Video has {num_frames} frames at {fps:.2f} FPS")
+                        else:
+                            logger.error(f"Could not open video file: {sample_video}")
+                            num_frames = 0
+                    except Exception as e:
+                        logger.error(f"Error reading video file: {e}")
                         num_frames = 0
-                except Exception as e:
-                    logger.error(f"Error reading video file: {e}")
-                    num_frames = 0
-            else:
-                # Fallback to counting from image directories
-                sample_dir = episode_dir / "left_images"
-                if sample_dir.exists():
+                elif sample_dir.exists():
                     frame_files = list(sample_dir.glob("frame_*.png"))
                     num_frames = len(frame_files)
                     logger.info(f"Found {num_frames} frames in {sample_dir}")
                 else:
-                    logger.error(f"Cannot determine number of frames for {episode_name}")
-                    logger.error(f"No video file or image directory found")
+                    logger.error(f"Cannot find {self.camera_to_process} camera data for {episode_name}")
+                    logger.error(f"No video file or image directory found for {self.camera_to_process}")
                     return
+            else:
+                # Original logic for all cameras
+                # First try to count frames from videos
+                sample_video = episode_dir / "left_camera.mp4"
+                if sample_video.exists():
+                    logger.info(f"Found video file, counting frames from: {sample_video}")
+                    try:
+                        cap = cv2.VideoCapture(str(sample_video))
+                        if cap.isOpened():
+                            num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            cap.release()
+                            logger.info(f"Video has {num_frames} frames at {fps:.2f} FPS")
+                        else:
+                            logger.error(f"Could not open video file: {sample_video}")
+                            num_frames = 0
+                    except Exception as e:
+                        logger.error(f"Error reading video file: {e}")
+                        num_frames = 0
+                else:
+                    # Fallback to counting from image directories
+                    sample_dir = episode_dir / "left_images"
+                    if sample_dir.exists():
+                        frame_files = list(sample_dir.glob("frame_*.png"))
+                        num_frames = len(frame_files)
+                        logger.info(f"Found {num_frames} frames in {sample_dir}")
+                    else:
+                        logger.error(f"Cannot determine number of frames for {episode_name}")
+                        logger.error(f"No video file or image directory found")
+                        return
         
         if num_frames == 0:
             logger.error(f"No frames found for {episode_name}")
@@ -923,7 +978,14 @@ class DatasetConverter:
         episode_robot_states = []
         failed_frames = 0
         
-        if self.sequential:
+        # Force sequential processing for single camera (more efficient)
+        if self.camera_to_process:
+            force_sequential = True
+            logger.info(f"Using sequential processing for single camera ({self.camera_to_process}) - more efficient")
+        else:
+            force_sequential = self.sequential
+        
+        if force_sequential:
             logger.info("Sequential processing mode enabled")
             # Sequential processing
             for frame_idx in tqdm(range(num_frames), desc=f"Processing {episode_name}"):
@@ -963,19 +1025,28 @@ class DatasetConverter:
                     failed_frames += 1
         else:
             # Parallel processing
-            logger.info(f"Processing frames in parallel with {self.max_workers} workers, batch size: {self.batch_size}")
+            # Optimize worker count and batch size for single camera processing
+            if self.camera_to_process:
+                # For single camera, use sequential processing or smaller batches
+                effective_workers = min(self.max_workers, 2)  # Limit workers for single camera
+                effective_batch_size = min(self.batch_size, 8)  # Smaller batches for single camera
+                logger.info(f"Processing {self.camera_to_process} camera frames with {effective_workers} workers, batch size: {effective_batch_size}")
+            else:
+                effective_workers = self.max_workers
+                effective_batch_size = self.batch_size
+                logger.info(f"Processing frames in parallel with {effective_workers} workers, batch size: {effective_batch_size}")
             
-            for batch_start in range(0, num_frames, self.batch_size):
-                batch_end = min(batch_start + self.batch_size, num_frames)
+            for batch_start in range(0, num_frames, effective_batch_size):
+                batch_end = min(batch_start + effective_batch_size, num_frames)
                 batch_frames = list(range(batch_start, batch_end))
                 
-                logger.info(f"  Processing batch {batch_start//self.batch_size + 1}/{(num_frames + self.batch_size - 1)//self.batch_size}: frames {batch_start}-{batch_end-1}")
+                logger.info(f"  Processing batch {batch_start//effective_batch_size + 1}/{(num_frames + effective_batch_size - 1)//effective_batch_size}: frames {batch_start}-{batch_end-1}")
                 
                 # Process batch of frames in parallel
                 batch_results = []
                 
                 # Use ThreadPoolExecutor for I/O bound operations
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                     # Submit frame processing tasks
                     future_to_frame = {}
                     for frame_idx in batch_frames:
