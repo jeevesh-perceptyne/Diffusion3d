@@ -31,7 +31,7 @@ from functools import partial
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def process_episode_worker(episode_name, dataset_path, cameras_path, workspace_bounds, num_points):
+def process_episode_worker(episode_name, dataset_path, cameras_path, workspace_bounds, num_points, camera_to_process=None):
     """
     Worker function for parallel episode processing.
     
@@ -41,6 +41,7 @@ def process_episode_worker(episode_name, dataset_path, cameras_path, workspace_b
         cameras_path (Path): Path to cameras config
         workspace_bounds (list): Workspace bounds
         num_points (int): Number of points for FPS
+        camera_to_process (str): Process only specific camera (optional)
         
     Returns:
         bool: True if successful, False otherwise
@@ -54,7 +55,8 @@ def process_episode_worker(episode_name, dataset_path, cameras_path, workspace_b
             num_points=num_points,
             workspace_bounds=workspace_bounds,
             max_workers=1,  # Use sequential processing within worker to avoid nested parallelism
-            sequential=True  # Force sequential frame processing in workers
+            sequential=True,  # Force sequential frame processing in workers
+            camera_to_process=camera_to_process
         )
         
         # Process the episode
@@ -66,7 +68,7 @@ def process_episode_worker(episode_name, dataset_path, cameras_path, workspace_b
         return False
 
 class DatasetConverter:
-    def __init__(self, dataset_path, cameras_path, output_path, num_points=4000, workspace_bounds=None, max_workers=None, batch_size=None, sequential=False):
+    def __init__(self, dataset_path, cameras_path, output_path, num_points=4000, workspace_bounds=None, max_workers=None, batch_size=None, sequential=False, camera_to_process=None):
         """
         Initialize the dataset converter.
         
@@ -79,6 +81,7 @@ class DatasetConverter:
             max_workers (int): Maximum number of parallel workers
             batch_size (int): Batch size for frame processing
             sequential (bool): Force sequential processing
+            camera_to_process (str): Process only specific camera ('left', 'right', 'wrist', or None for all)
         """
         logger.info("=== Initializing DatasetConverter ===")
         
@@ -89,12 +92,17 @@ class DatasetConverter:
         self.max_workers = max_workers or min(mp.cpu_count(), 8)
         self.batch_size = batch_size or (self.max_workers * 2)
         self.sequential = sequential
+        self.camera_to_process = camera_to_process
         
         logger.info(f"Dataset path: {self.dataset_path}")
         logger.info(f"Cameras config path: {self.cameras_path}")
         if self.output_path:
             logger.info(f"Output path: {self.output_path}")
         logger.info(f"Target points per cloud: {self.num_points}")
+        if self.camera_to_process:
+            logger.info(f"Processing only camera: {self.camera_to_process}")
+        else:
+            logger.info("Processing all cameras")
         logger.info(f"Parallelization settings:")
         logger.info(f"  - Max workers: {self.max_workers}")
         logger.info(f"  - Batch size: {self.batch_size}")
@@ -112,9 +120,9 @@ class DatasetConverter:
         # Default workspace bounds (adjust based on your robot setup)
         if workspace_bounds is None:
             self.workspace_bounds = [
-                [0.3, 1.0],   # x: forward/backward from robot base
-                [-0.5, 0.5],  # y: left/right from robot base  
-                [-0.1, 0.8]   # z: up/down from robot base
+                [-0.1, 0.8],   # x: forward/backward from robot base
+                [-0.35, 0.3],  # y: left/right from robot base
+                [-0.1, 0.8]    # z: up/down from robot base
             ]
             logger.info("Using default workspace bounds:")
         else:
@@ -129,10 +137,14 @@ class DatasetConverter:
         self.load_camera_config()
         
         logger.info("=== DatasetConverter initialized successfully ===")
-        logger.info("PCD files will be saved directly in each episode directory")
-        logger.info("  - wrist_pcd/frame_XXXXXX.pcd (4000 points)")
-        logger.info("  - merged_4000/frame_XXXXXX.pcd (left+right merged, 4000 points)") 
-        logger.info("  - merged_1024/frame_XXXXXX.pcd (left+right merged, 1024 points)")
+        if self.camera_to_process:
+            logger.info(f"PCD files will be saved for {self.camera_to_process} camera only:")
+            logger.info(f"  - {self.camera_to_process}_pcd/frame_XXXXXX.pcd (4000 points)")
+        else:
+            logger.info("PCD files will be saved directly in each episode directory")
+            logger.info("  - wrist_pcd/frame_XXXXXX.pcd (4000 points)")
+            logger.info("  - merged_4000/frame_XXXXXX.pcd (left+right merged, 4000 points)") 
+            logger.info("  - merged_1024/frame_XXXXXX.pcd (left+right merged, 1024 points)")
         logger.info("")
         
     def load_camera_config(self):
@@ -582,6 +594,8 @@ class DatasetConverter:
         # Create camera-specific PCD directory
         camera_folder_mapping = {
             'wrist_camera': 'wrist_pcd',
+            'left_camera': 'left_pcd',
+            'right_camera': 'right_pcd',
             'merged_4000': 'merged_4000',
             'merged_1024': 'merged_1024'
         }
@@ -677,7 +691,7 @@ class DatasetConverter:
     
     def process_frame(self, episode_dir, frame_idx, end_effector_pose=None):
         """
-        Process a single frame from all cameras in parallel.
+        Process a single frame from cameras based on camera_to_process filter.
         
         Args:
             episode_dir (Path): Episode directory
@@ -691,11 +705,24 @@ class DatasetConverter:
         frame_data = {}
         
         # Camera mappings (adjust based on your setup)
-        camera_mappings = {
+        all_camera_mappings = {
             'left_camera': 'left',
             'wrist_camera': 'wrist', 
             'right_camera': 'right'
         }
+        
+        # Filter camera mappings based on camera_to_process
+        if self.camera_to_process:
+            camera_name = f"{self.camera_to_process}_camera"
+            if camera_name in all_camera_mappings:
+                camera_mappings = {camera_name: all_camera_mappings[camera_name]}
+                logger.debug(f"  Processing only {self.camera_to_process} camera")
+            else:
+                logger.error(f"  Invalid camera_to_process: {self.camera_to_process}")
+                return frame_data
+        else:
+            camera_mappings = all_camera_mappings
+            logger.debug(f"  Processing all cameras")
         
         logger.debug(f"  Camera mappings: {camera_mappings}")
         
@@ -703,7 +730,7 @@ class DatasetConverter:
         camera_point_clouds = {}
         
         # Use ThreadPoolExecutor for I/O bound operations (reading images)
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=min(3, len(camera_mappings))) as executor:
             # Submit all camera processing tasks
             future_to_camera = {}
             for camera_name, folder_prefix in camera_mappings.items():
@@ -720,74 +747,100 @@ class DatasetConverter:
                     camera_point_clouds[camera_name] = points
                     logger.debug(f"    {camera_name}: {len(points)} points processed")
         
-        # Step 2: Process wrist camera (individual processing, crop, FPS, save)
-        if 'wrist_camera' in camera_point_clouds:
-            logger.debug(f"  Processing wrist camera individually...")
-            wrist_points = camera_point_clouds['wrist_camera']
-            
-            # Crop to workspace
-            logger.debug(f"    Cropping wrist camera to workspace...")
-            wrist_points = self.crop_workspace(wrist_points)
-            
-            if len(wrist_points) > 0:
-                logger.debug(f"    After cropping: {len(wrist_points)} points")
+        # Step 2: Process individual cameras if specified
+        if self.camera_to_process:
+            camera_name = f"{self.camera_to_process}_camera"
+            if camera_name in camera_point_clouds:
+                logger.debug(f"  Processing {self.camera_to_process} camera individually...")
+                camera_points = camera_point_clouds[camera_name]
                 
-                # Apply FPS (4000 points)
-                logger.debug(f"    Applying FPS to wrist camera...")
-                wrist_points = self.farthest_point_sampling(wrist_points, 4000)
+                # Crop to workspace
+                logger.debug(f"    Cropping {self.camera_to_process} camera to workspace...")
+                camera_points = self.crop_workspace(camera_points)
                 
-                logger.debug(f"    Final wrist point cloud: {len(wrist_points)} points")
-                
-                # Save wrist PCD file
-                self.save_frame_pcd(episode_dir, 'wrist_camera', frame_idx, wrist_points)
-                frame_data['wrist_camera'] = wrist_points
-            else:
-                logger.warning(f"    No wrist points in workspace for frame {frame_idx}")
-        
-        # Step 3: Merge left and right cameras and process in parallel
-        if 'left_camera' in camera_point_clouds and 'right_camera' in camera_point_clouds:
-            logger.debug(f"  Merging left and right camera point clouds...")
-            left_points = camera_point_clouds['left_camera']
-            right_points = camera_point_clouds['right_camera']
-            
-            # Merge point clouds
-            merged_points = np.vstack([left_points, right_points])
-            logger.debug(f"    Merged point cloud: {len(merged_points)} points (left: {len(left_points)}, right: {len(right_points)})")
-            
-            # Crop merged point cloud to workspace
-            logger.debug(f"    Cropping merged point cloud to workspace...")
-            merged_points = self.crop_workspace(merged_points)
-            
-            if len(merged_points) > 0:
-                logger.debug(f"    After cropping: {len(merged_points)} points")
-                
-                # Process both FPS versions in parallel using ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    # Submit FPS tasks
-                    future_4000 = executor.submit(self.farthest_point_sampling, merged_points, 4000)
-                    future_1024 = executor.submit(self.farthest_point_sampling, merged_points, 1024)
+                if len(camera_points) > 0:
+                    logger.debug(f"    After cropping: {len(camera_points)} points")
                     
-                    # Get results
-                    merged_4000 = future_4000.result()
-                    merged_1024 = future_1024.result()
-                
-                logger.debug(f"    Merged 4000 point cloud: {len(merged_4000)} points")
-                logger.debug(f"    Merged 1024 point cloud: {len(merged_1024)} points")
-                
-                # Save merged PCD files in parallel
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    executor.submit(self.save_frame_pcd, episode_dir, 'merged_4000', frame_idx, merged_4000)
-                    executor.submit(self.save_frame_pcd, episode_dir, 'merged_1024', frame_idx, merged_1024)
-                
-                frame_data['merged_4000'] = merged_4000
-                frame_data['merged_1024'] = merged_1024
-            else:
-                logger.warning(f"    No merged points in workspace for frame {frame_idx}")
+                    # Apply FPS (4000 points)
+                    logger.debug(f"    Applying FPS to {self.camera_to_process} camera...")
+                    camera_points = self.farthest_point_sampling(camera_points, 4000)
+                    
+                    logger.debug(f"    Final {self.camera_to_process} point cloud: {len(camera_points)} points")
+                    
+                    # Save camera PCD file
+                    self.save_frame_pcd(episode_dir, camera_name, frame_idx, camera_points)
+                    frame_data[camera_name] = camera_points
+                else:
+                    logger.warning(f"    No {self.camera_to_process} points in workspace for frame {frame_idx}")
         else:
-            if 'left_camera' not in camera_point_clouds:
-                logger.warning(f"    Missing left camera for frame {frame_idx}")
-            if 'right_camera' not in camera_point_clouds:
-                logger.warning(f"    Missing right camera for frame {frame_idx}")
+            # Step 2: Process wrist camera (individual processing, crop, FPS, save)
+            if 'wrist_camera' in camera_point_clouds:
+                logger.debug(f"  Processing wrist camera individually...")
+                wrist_points = camera_point_clouds['wrist_camera']
+                
+                # Crop to workspace
+                logger.debug(f"    Cropping wrist camera to workspace...")
+                wrist_points = self.crop_workspace(wrist_points)
+                
+                if len(wrist_points) > 0:
+                    logger.debug(f"    After cropping: {len(wrist_points)} points")
+                    
+                    # Apply FPS (4000 points)
+                    logger.debug(f"    Applying FPS to wrist camera...")
+                    wrist_points = self.farthest_point_sampling(wrist_points, 4000)
+                    
+                    logger.debug(f"    Final wrist point cloud: {len(wrist_points)} points")
+                    
+                    # Save wrist PCD file
+                    self.save_frame_pcd(episode_dir, 'wrist_camera', frame_idx, wrist_points)
+                    frame_data['wrist_camera'] = wrist_points
+                else:
+                    logger.warning(f"    No wrist points in workspace for frame {frame_idx}")
+            
+            # Step 3: Merge left and right cameras and process in parallel
+            if 'left_camera' in camera_point_clouds and 'right_camera' in camera_point_clouds:
+                logger.debug(f"  Merging left and right camera point clouds...")
+                left_points = camera_point_clouds['left_camera']
+                right_points = camera_point_clouds['right_camera']
+                
+                # Merge point clouds
+                merged_points = np.vstack([left_points, right_points])
+                logger.debug(f"    Merged point cloud: {len(merged_points)} points (left: {len(left_points)}, right: {len(right_points)})")
+                
+                # Crop merged point cloud to workspace
+                logger.debug(f"    Cropping merged point cloud to workspace...")
+                merged_points = self.crop_workspace(merged_points)
+                
+                if len(merged_points) > 0:
+                    logger.debug(f"    After cropping: {len(merged_points)} points")
+                    
+                    # Process both FPS versions in parallel using ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        # Submit FPS tasks
+                        future_4000 = executor.submit(self.farthest_point_sampling, merged_points, 4000)
+                        future_1024 = executor.submit(self.farthest_point_sampling, merged_points, 1024)
+                        
+                        # Get results
+                        merged_4000 = future_4000.result()
+                        merged_1024 = future_1024.result()
+                    
+                    logger.debug(f"    Merged 4000 point cloud: {len(merged_4000)} points")
+                    logger.debug(f"    Merged 1024 point cloud: {len(merged_1024)} points")
+                    
+                    # Save merged PCD files in parallel
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        executor.submit(self.save_frame_pcd, episode_dir, 'merged_4000', frame_idx, merged_4000)
+                        executor.submit(self.save_frame_pcd, episode_dir, 'merged_1024', frame_idx, merged_1024)
+                    
+                    frame_data['merged_4000'] = merged_4000
+                    frame_data['merged_1024'] = merged_1024
+                else:
+                    logger.warning(f"    No merged points in workspace for frame {frame_idx}")
+            else:
+                if 'left_camera' not in camera_point_clouds:
+                    logger.warning(f"    Missing left camera for frame {frame_idx}")
+                if 'right_camera' not in camera_point_clouds:
+                    logger.warning(f"    Missing right camera for frame {frame_idx}")
         
         logger.debug(f"  Frame {frame_idx} processed successfully with {len(frame_data)} outputs")
         return frame_data
@@ -1042,9 +1095,12 @@ class DatasetConverter:
             logger.warning(f"Failed to save processing summary: {e}")
         
         logger.info(f"PCD files saved in output-specific directories within: {episode_dir}")
-        logger.info(f"  - wrist_pcd/ (wrist camera point clouds - 4000 points)")
-        logger.info(f"  - merged_4000/ (merged left+right point clouds - 4000 points)")
-        logger.info(f"  - merged_1024/ (merged left+right point clouds - 1024 points)")
+        if self.camera_to_process:
+            logger.info(f"  - {self.camera_to_process}_pcd/ ({self.camera_to_process} camera point clouds - 4000 points)")
+        else:
+            logger.info(f"  - wrist_pcd/ (wrist camera point clouds - 4000 points)")
+            logger.info(f"  - merged_4000/ (merged left+right point clouds - 4000 points)")
+            logger.info(f"  - merged_1024/ (merged left+right point clouds - 1024 points)")
         logger.info(f"=== Finished processing {episode_name} ===\n")
     
     def process_all_episodes(self, episode_filter=None):
@@ -1058,10 +1114,15 @@ class DatasetConverter:
         logger.info(f"Dataset path: {self.dataset_path}")
         logger.info(f"Workspace bounds: {self.workspace_bounds}")
         logger.info(f"Points per cloud (FPS): {self.num_points}")
-        logger.info("PCD files will be saved directly in each episode directory")
-        logger.info("  - wrist_pcd/ (4000 points)")
-        logger.info("  - merged_4000/ (left+right merged, 4000 points)")
-        logger.info("  - merged_1024/ (left+right merged, 1024 points)")
+        if self.camera_to_process:
+            logger.info(f"Processing only {self.camera_to_process} camera")
+            logger.info(f"PCD files will be saved in: {self.camera_to_process}_pcd/ (4000 points)")
+        else:
+            logger.info("Processing all cameras")
+            logger.info("PCD files will be saved directly in each episode directory")
+            logger.info("  - wrist_pcd/ (4000 points)")
+            logger.info("  - merged_4000/ (left+right merged, 4000 points)")
+            logger.info("  - merged_1024/ (left+right merged, 1024 points)")
         
         # Get all episode directories
         logger.info("Scanning for episode directories...")
@@ -1113,7 +1174,8 @@ class DatasetConverter:
                     dataset_path=self.dataset_path,
                     cameras_path=self.cameras_path,
                     workspace_bounds=self.workspace_bounds,
-                    num_points=self.num_points
+                    num_points=self.num_points,
+                    camera_to_process=self.camera_to_process
                 )
                 
                 # Submit episode processing tasks
@@ -1151,10 +1213,13 @@ class DatasetConverter:
         
         if successful_episodes > 0:
             logger.info(f"PCD files saved in episode directories under: {self.dataset_path}")
-            logger.info("Each episode contains output-specific PCD directories:")
-            logger.info("  - wrist_pcd/ (wrist camera - 4000 points)")
-            logger.info("  - merged_4000/ (left+right merged - 4000 points)")
-            logger.info("  - merged_1024/ (left+right merged - 1024 points)")
+            if self.camera_to_process:
+                logger.info(f"Each episode contains: {self.camera_to_process}_pcd/ (4000 points)")
+            else:
+                logger.info("Each episode contains output-specific PCD directories:")
+                logger.info("  - wrist_pcd/ (wrist camera - 4000 points)")
+                logger.info("  - merged_4000/ (left+right merged - 4000 points)")
+                logger.info("  - merged_1024/ (left+right merged - 1024 points)")
         
         logger.info("=== Dataset Processing Finished ===")
         return successful_episodes, failed_episodes
@@ -1181,6 +1246,8 @@ def main():
                        help='Batch size for frame processing (default: auto-detect)')
     parser.add_argument('--sequential', action='store_true',
                        help='Force sequential processing (disable parallelization)')
+    parser.add_argument('--camera_to_process', type=str, choices=['left', 'right', 'wrist'], default=None,
+                       help='Process only specific camera (left, right, or wrist). If not specified, processes all cameras.')
     
     args = parser.parse_args()
     
@@ -1211,7 +1278,8 @@ def main():
             workspace_bounds=workspace_bounds,
             max_workers=args.max_workers,
             batch_size=args.batch_size,
-            sequential=args.sequential
+            sequential=args.sequential,
+            camera_to_process=args.camera_to_process
         )
         
         # Process episodes
